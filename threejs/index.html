@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>three.js xr - haptics</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+		<link type="text/css" rel="stylesheet" href="main.css">
+		<style>
+#xr-overlay {
+	position: absolute;
+	top: 20px;
+	right: 20px;
+}
+		</style>
+	</head>
+	<body>
+		<div id="info">
+			<a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> xr - haptics
+		</div>
+
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "../build/three.module.js", "three/addons/": "./jsm/"
+				}
+			}
+		</script>
+
+		<!--script src="pitchshift.js"></script>
+		<script src="dsp.js"></script-->
+		<script type="module">
+//import './pitchshift.js';
+const DSP = window.DSP;
+import GUI from 'three/addons/libs/lil-gui.module.min.js';
+import * as THREE from 'three';
+import { CSS3DRenderer, CSS3DObject } from 'three/addons/renderers/CSS3DRenderer.js';
+import { HTMLMesh } from 'three/addons/interactive/HTMLMesh.js';
+import { InteractiveGroup } from 'three/addons/interactive/InteractiveGroup.js';
+//import { MeshBVH, acceleratedRaycast } from 'three-mesh-bvh';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { XRButton } from 'three/addons/webxr/XRButton.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+//geometry.computeBoundsTree = MeshBVH.prototype.build;
+//geometry.computeBoundsTree();
+
+let container;
+let camera, scene, renderer;
+let listener;
+let controller1, controller2;
+let controllerGrip1, controllerGrip2;
+let controllerGrips = [];				window.controllerGrips = controllerGrips;
+const box = new THREE.Box3();
+let controls, nodeGroup;				window.controls = controls;	window.nodeGroup = nodeGroup;
+
+let raycaster = new THREE.Raycaster();	window.raycaster = raycaster;
+let mouse = new THREE.Vector2();		window.mouse = mouse;
+let INTERSECTED = null;
+let mouseAudio;
+let mouseOscillator;
+let objWall;
+let objPick1;
+let objPick2;
+let objFrmOptions;
+let lastTime = 0;
+let css3dRenderer;
+let guiScene = null;
+let guiCamera = null;
+let guiGroup = null;
+let nodeSpace = .05;
+let nodeSize = nodeSpace * .8;
+let valsOptions = {};
+let ctrlChords;
+
+let iOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+let NOTE_NAMES_12 = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+let NOTE_NAMES_24 = ["C","C\u2021","C#","D\u2422","D","D\u2021","D#","E\u2422","E","E\u2021","F","F\u2021",
+					 "F#","G\u2422","G","G\u2021","G#","A\u2422","A","A\u2021","A#","B\u2422","B","B\u2021"];
+let NUM_COLS = 25;
+let NUM_NOTES = 12;	//12 TET
+let AUDIO = iOS ? new webkitAudioContext() : new AudioContext();
+let GAIN = AUDIO.createGain();
+GAIN.connect( AUDIO.destination );
+let ANALYSER = AUDIO.createAnalyser();
+ANALYSER.fftSize = 2048;
+let BUFFER  = [];	//Stores instrument buffer
+let SOURCES = [];	//Stores instances of sound sources
+let TUNING_ST = [-20,-15,-10,-5,-1,4];
+let SCALE_ST  = [0,2,4,5,7,9,11];
+let SHIFT_ST = 0;
+let ECHO = false;
+let BPM = 120;
+let SOUND_MODE = "sample";//oscillator, sample
+let INSTRUMENT_NATIVE_NOTE;
+let SCALE_TOLERANCE_ST = 0.15;
+let PROGRESSION = [];
+PROGRESSION.push([0,4,7]);
+PROGRESSION.push([9,0,4]);
+PROGRESSION.push([5,9,0]);
+PROGRESSION.push([7,11,2]);
+let PROGRESSION_INDEX = 0;
+let CHORD_ST = PROGRESSION[PROGRESSION_INDEX];
+
+function intToRoman(num) {
+    const romanMap = [
+        { val: 1000, sym: "M" },
+        { val: 900,  sym: "CM" },
+        { val: 500,  sym: "D" },
+        { val: 400,  sym: "CD" },
+        { val: 100,  sym: "C" },
+        { val: 90,   sym: "XC" },
+        { val: 50,   sym: "L" },
+        { val: 40,   sym: "XL" },
+        { val: 10,   sym: "X" },
+        { val: 9,    sym: "IX" },
+        { val: 5,    sym: "V" },
+        { val: 4,    sym: "IV" },
+        { val: 1,    sym: "I" },
+    ];
+    let result = "";
+    for (const {val, sym} of romanMap) {
+        while (num >= val) {
+            result += sym;
+            num -= val;
+        }
+    }
+    return result;
+} //intToRoman
+
+function mod12(note){
+	return (note + 1000*12) % 12;
+} //mod12
+
+function semitonesToFreqCoeff(shift){
+	return Math.pow(2, shift/12);
+} //semitonesToFreqCoeff
+
+function freqCoeffToSemitones(freqCoeff){
+	return 12*Math.log2(freqCoeff);
+} //freqCoeffToSemitones
+
+function noteToCssRgb1(note, inScale){
+	var phase = -2*Math.PI * note/12;
+	var r = (Math.cos(phase+Math.PI*(0/3+1/6))+1)/2;
+	var g = (Math.cos(phase+Math.PI*(2/3+1/6))+1)/2;
+	var b = (Math.cos(phase+Math.PI*(4/3+1/6))+1)/2;
+	r = inScale ? (1+r)/2 : r/2;
+	g = inScale ? (1+g)/2 : g/2;
+	b = inScale ? (1+b)/2 : b/2;
+	r = parseInt(r*255),	g = parseInt(g*255),	b = parseInt(b*255);
+	return "rgb("+r+", "+g+", "+b+")";
+} //noteToCssRgb1
+function noteToCssRgb2(note, inScale){
+	return $.Color({ hue: 360*mod12(-note)/12 , saturation:inScale?1:1, lightness: inScale?0.5:0.2 }).toString();
+} //noteToCssRgb2
+let noteToCssRgb = noteToCssRgb1;
+
+function freqToNote(freq){
+	return freqCoeffToSemitones((freq-3)/110);
+} //noteToFreq
+
+function noteToFreq(note){
+	return 110 * semitonesToFreqCoeff(note+3);
+} //noteToFreq
+
+function noteToThreeColor(note, inScale){
+	var phase = -2*Math.PI * note/12;
+	var r = (Math.cos(phase+Math.PI*(0/3+1/6))+1)/2;
+	var g = (Math.cos(phase+Math.PI*(2/3+1/6))+1)/2;
+	var b = (Math.cos(phase+Math.PI*(4/3+1/6))+1)/2;
+	r = inScale ? (1+r)/2 : r/2;
+	g = inScale ? (1+g)/2 : g/2;
+	b = inScale ? (1+b)/2 : b/2;
+	return new THREE.Color( r, g, b );
+} //noteToThreeColor
+
+function noteToName(note){
+	var index = NOTE_NAMES_24.length * mod12(note)/12;
+	if( index.toFixed(2) != Math.round(index.toFixed(2)) )
+		return "";
+	return NOTE_NAMES_24[ index ];
+}//noteToName
+
+function nameToNote(name){
+	for(var note=0; note<NOTE_NAMES_24.length; note++)
+		if( NOTE_NAMES_24[note]==name.toUpperCase() )
+			return note;
+	return -1;
+}//nameToNote
+
+function noteIsInScale(note, scale){
+	if(!scale)	scale = SCALE_ST;
+	var st = mod12(note - SHIFT_ST);	//
+	for(var i=0; i<scale.length; i++)
+		if( Math.abs(st - mod12(scale[i])) < SCALE_TOLERANCE_ST 
+		 || Math.abs(st - 12 - mod12(scale[i])) < SCALE_TOLERANCE_ST )
+			return true;
+	return false;
+} //noteIsInScale
+
+function notesAreInScale(notes, scale){
+	if(!scale)	scale = SCALE_ST;
+	var inScale = true;
+	for(var n=0; n<notes.length; n++)
+		if( !noteIsInScale(notes[n], scale) )
+			inScale = false;
+	return inScale;
+} //notesAreInScale
+
+function getBufferNoteFloat(buffer) {
+	const sampleRate = buffer.sampleRate;
+	const data = buffer.getChannelData(0);
+	const size = 2048;
+	const slice = data.slice(0, size);
+	let maxMag = 0;
+	let maxFreq = 0;
+	for (let k = 1; k < size / 2; k++) {
+		let real = 0;
+		let imag = 0;
+		for (let n = 0; n < size; n++) {
+			const angle = (2 * Math.PI * k * n) / size;
+			real += slice[n] * Math.cos(angle);
+			imag -= slice[n] * Math.sin(angle);
+		}
+		const mag = real * real + imag * imag;
+		if (mag > maxMag) {
+			maxMag = mag;
+			maxFreq = k;
+		}
+	}
+	const freq = (maxFreq * sampleRate) / size;
+	const note = NUM_NOTES*Math.log2(freq/440)-3;
+//console.log(`freq=${freq} note=${note}`);
+	return note;
+} //getBufferNoteFloat
+
+function loadSound(url, callback){
+	var request = new XMLHttpRequest();
+	request.open("GET", url, true);
+	request.responseType = "arraybuffer";
+	request.onload = function(){
+		try{
+			AUDIO.decodeAudioData( request.response, function(buffer){ if(callback) callback(buffer); } );
+		}catch(ex){}
+	}
+	request.send();
+} //loadSound
+
+//var period = 60/(BPM*NPB), tNext = Math.ceil(AUDIO.currentTime / period)*period + tickDelay*period;//0
+//SOURCE_CUR = playSound( SHIFTED_BUFFERS[instrument][oct-SHIFTED_BUFFERS_MIN], tNext, semitonesToFreqCoeff(shift - INSTRUMENT_NATIVE_NOTE), note2 );
+function playSound(buffer, time, freqCoeff, note){
+	try{
+		time = time ? time : 0;
+		note = note ? note : 0;
+		var source = AUDIO.createBufferSource();	//Sound source
+		source.buffer = buffer;	//TypeError: Failed to set the 'buffer' property on 'AudioBufferSourceNode': Failed to convert value to 'AudioBuffer'.
+	//	source.connect( AUDIO.destination );	//Destination = Speakers
+	//	source.connect( GAIN );	//SOURCE - GAIN - DESTINATION (Speakers)
+		GAIN.gain.value = 0.1;
+		
+		if(ECHO){
+			var delay = AUDIO.createDelay();
+			delay.delayTime.value = 60/BPM;
+			var feedback = AUDIO.createGain();
+			feedback.gain.value = 0.5;
+			delay.connect(feedback);
+			feedback.connect(delay);
+			source.connect(delay);
+			delay.connect(GAIN);
+		}
+		source.connect(GAIN);
+		
+	//	source.scaleFrequencyViaPlayback( freqCoeff );
+		source.playbackRate.value = freqCoeff;
+		source.note = note;
+//		source.octaveIndex = parseInt(note/SHIFTED_BUFFERS_INTERVAL_ST);
+//		source.setStartTime();	//Extend to hold startTime
+		source.startTime = source.context.currentTime;
+		source.start( time );	//Schedules when time==AUDIO.currentTime seconds
+		SOURCES.push( source );
+		return source;
+	}catch(ex){
+		console.log(ex);
+		return null;
+	}
+} //playSound
+
+function meshIntersectsMesh(meshA, meshB) {
+	try {
+		const posA = meshA.geometry.attributes.position;
+		const posB = meshB.geometry.attributes.position;
+		const matA = meshA.matrixWorld;
+		const matB = meshB.matrixWorld;
+		const triA = new THREE.Triangle();
+		const triB = new THREE.Triangle();
+		const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+		const d = new THREE.Vector3(), e = new THREE.Vector3(), f = new THREE.Vector3();
+		for (let i = 0; i < posA.count; i += 3) {
+			a.fromBufferAttribute(posA, i).applyMatrix4(matA);
+			b.fromBufferAttribute(posA, i+1).applyMatrix4(matA);
+			c.fromBufferAttribute(posA, i+2).applyMatrix4(matA);
+			triA.set(a, b, c);
+			for (let j = 0; j < posB.count; j += 3) {
+				d.fromBufferAttribute(posB, j).applyMatrix4(matB);
+				e.fromBufferAttribute(posB, j+1).applyMatrix4(matB);
+				f.fromBufferAttribute(posB, j+2).applyMatrix4(matB);
+				triB.set(d, e, f);
+				if (triangleIntersectsTriangle(triA, triB)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+	catch( err ) {
+		return false;
+	}
+} //meshIntersectsMesh
+
+function triangleIntersectsTriangle(a, b) {
+    // a, b are THREE.Triangle
+    const EPSILON = 1e-10;
+    const a1 = a.a, a2 = a.b, a3 = a.c;
+    const b1 = b.a, b2 = b.b, b3 = b.c;
+    // Triangle edges
+    const e1 = new THREE.Vector3().subVectors(a2, a1);
+    const e2 = new THREE.Vector3().subVectors(a3, a1);
+    const f1 = new THREE.Vector3().subVectors(b2, b1);
+    const f2 = new THREE.Vector3().subVectors(b3, b1);
+    // Normals
+    const n1 = new THREE.Vector3().crossVectors(e1, e2).normalize();
+    const n2 = new THREE.Vector3().crossVectors(f1, f2).normalize();
+    // Plane distances
+    const d1 = -n1.dot(a1);
+    const d2 = -n2.dot(b1);
+	
+    function signedDist(n, d, p) {
+        return n.dot(p) + d;
+    }
+
+    // --- 1. Test triangle A against plane of B
+    let da1 = signedDist(n2, d2, a1);
+    let da2 = signedDist(n2, d2, a2);
+    let da3 = signedDist(n2, d2, a3);
+    if ((da1 > EPSILON && da2 > EPSILON && da3 > EPSILON) ||
+        (da1 < -EPSILON && da2 < -EPSILON && da3 < -EPSILON)) {
+        return false;
+    }
+
+    // --- 2. Test triangle B against plane of A
+    let db1 = signedDist(n1, d1, b1);
+    let db2 = signedDist(n1, d1, b2);
+    let db3 = signedDist(n1, d1, b3);
+    if ((db1 > EPSILON && db2 > EPSILON && db3 > EPSILON) ||
+        (db1 < -EPSILON && db2 < -EPSILON && db3 < -EPSILON)) {
+        return false;
+    }
+    // --- 3. Edge cross products (SAT axes)
+    const edgesA = [
+        new THREE.Vector3().subVectors(a2, a1),
+        new THREE.Vector3().subVectors(a3, a2),
+        new THREE.Vector3().subVectors(a1, a3)
+    ];
+    const edgesB = [
+        new THREE.Vector3().subVectors(b2, b1),
+        new THREE.Vector3().subVectors(b3, b2),
+        new THREE.Vector3().subVectors(b1, b3)
+    ];
+    const axis = new THREE.Vector3();
+	
+    function project(tri, axis) {
+        const p1 = tri.a.dot(axis);
+        const p2 = tri.b.dot(axis);
+        const p3 = tri.c.dot(axis);
+        return [Math.min(p1, p2, p3), Math.max(p1, p2, p3)];
+    }
+
+    function overlap(a, b) {
+        return a[1] >= b[0] && b[1] >= a[0];
+    }
+
+    for (let i = 0; i < 3; i++) {
+        for (let j = 0; j < 3; j++) {
+            axis.crossVectors(edgesA[i], edgesB[j]);
+
+            if (axis.lengthSq() < EPSILON) continue;
+
+            axis.normalize();
+
+            const projA = project(a, axis);
+            const projB = project(b, axis);
+
+            if (!overlap(projA, projB)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+} //triangleIntersectsTriangle
+
+
+
+init();
+
+function init() {
+	container = document.createElement( 'div' );
+	document.body.appendChild( container );
+
+	scene = new THREE.Scene();
+	scene.background = new THREE.Color( 0x808080 );
+
+	camera = new THREE.PerspectiveCamera( 50, window.innerWidth / window.innerHeight, 0.1, 10 );
+	camera.position.set( 0, 1.6, 3 );
+
+	listener = new THREE.AudioListener();
+	camera.add( listener );
+
+	controls = new OrbitControls( camera, container );
+	controls.target.set( 0, 1.6, 0 );
+	controls.update();
+
+	//Lights
+	scene.add( new THREE.HemisphereLight( 0xbcbcbc, 0xa5a5a5, 3 ) );
+
+	const light = new THREE.DirectionalLight( 0xffffff, 3 );
+	light.position.set( 0, 6, 0 );
+	light.castShadow = true;
+	light.shadow.camera.top = 2;
+	light.shadow.camera.bottom = - 2;
+	light.shadow.camera.right = 2;
+	light.shadow.camera.left = - 2;
+	light.shadow.mapSize.set( 4096, 4096 );
+	scene.add( light );
+
+	//Floor
+	const geoFloor = new THREE.PlaneGeometry( 4, 4 );
+	const matFloor = new THREE.ShadowMaterial( {opacity: 0.25, blending: THREE.CustomBlending, transparent: false} );
+	const floor = new THREE.Mesh( geoFloor, matFloor );
+	floor.rotation.x = -Math.PI / 2;
+	floor.receiveShadow = true;
+	scene.add( floor );
+
+	//Pick
+	const geoPick = new THREE.BoxGeometry( .01, .1, .1 );
+	const matPick = new THREE.MeshStandardMaterial({color: "#888", roughness: 0.7, metalness: 0.0});
+	objPick1 = new THREE.Mesh( geoPick, matPick );
+	objPick1.visible = false;
+	objPick2 = objPick1.clone();
+	scene.add( objPick1 );
+	scene.add( objPick2 );
+	
+	//Node group
+	nodeGroup = new THREE.Group();
+	nodeGroup.rotation.set(-Math.PI/2, 0, 0);
+	nodeGroup.position.set(0, 1, -.5);	//x,y,z = right,up,back; 1/2 m in front of user, 1 m above floor
+	scene.add( nodeGroup );
+	//Create node array
+	for (let i=0; i<TUNING_ST.length; i++) {
+		for (let j=0; j<NUM_COLS; j++) {
+			const intensity = 1.0;
+			const note = TUNING_ST[i] + j;
+			const noteName = noteToName(note);
+			const inScale  = noteIsInScale(note, SCALE_ST);
+			const inChord  = noteIsInScale(note, CHORD_ST);
+			const noteColor  = noteToCssRgb(note, inScale);
+			const noteColor3 = noteToThreeColor(note, inScale);
+			
+			const geoNode = new THREE.BoxGeometry( nodeSize, nodeSize, nodeSize );
+			const textTexture = createTextTexture(noteName, 'black', noteColor);
+			const matBase = new THREE.MeshStandardMaterial({
+				color: noteColor3, roughness: 0.7, metalness: 0.0
+			});
+			const matText = new THREE.MeshStandardMaterial({
+				map: textTexture, //transparent: true,
+			//	map: null, alphaMap: textTexture,
+				roughness: 0.7, metalness: 0.0
+			});
+			const matsNode = [matBase,matBase,matBase,matBase,matText, matBase];//R,L,Top,Bot,Front,Back
+
+			const node = new THREE.Mesh(geoNode, matsNode);
+			node.userData.matBase = matBase;
+			
+			node.position.x = (j - NUM_COLS/2) * nodeSpace;	//x,y,z = right,up,back //Use inScale
+			node.position.y = (i - TUNING_ST.length/2) * nodeSpace;
+			node.position.z = (inScale ? nodeSpace : 0) + (inChord ? nodeSpace : 0);	//Raise relevant notes
+			node.castShadow = true;
+			node.receiveShadow = true;
+			node.userData = {
+				index: i + 1,
+				note: note,
+				intensity: intensity
+			};
+			nodeGroup.add( node );
+		} //for fret
+	} //for string
+	
+	//Time wall
+	const geoWall = new THREE.BoxGeometry( nodeSpace*NUM_COLS, nodeSpace*TUNING_ST.length, .01 );	//x,y,z = right,up,back
+	const matWall = new THREE.MeshStandardMaterial({
+		color: "white", roughness: 0.5, metalness: 0.0, transparent: true, opacity: 0.1
+	});
+	objWall = new THREE.Mesh(geoWall, matWall);
+//	objWall.position.set(0, 1, nodeGroup.position.z-1);//x,y,z = right,up,back
+	objWall.position.set(nodeGroup.position.x, nodeGroup.position.y, nodeGroup.position.z);//x,y,z = right,up,back
+//	scene.add( objWall );
+	
+	//Renderer
+	renderer = new THREE.WebGLRenderer( { antialias: true } );
+	renderer.setPixelRatio( window.devicePixelRatio );
+	renderer.setSize( window.innerWidth, window.innerHeight );
+	renderer.setAnimationLoop( animate );
+	renderer.shadowMap.enabled = true;
+	renderer.xr.enabled = true;
+	container.appendChild( renderer.domElement );
+	document.body.appendChild( XRButton.createButton( renderer ) );
+
+	controller1 = renderer.xr.getController( 0 );
+	scene.add( controller1 );
+	controller2 = renderer.xr.getController( 1 );
+	scene.add( controller2 );
+
+	const controllerModelFactory = new XRControllerModelFactory();
+	controllerGrips = [];
+	
+	controllerGrip1 = renderer.xr.getControllerGrip( 0 );
+	controllerGrip1.addEventListener( 'connected', controllerConnected );
+	controllerGrip1.addEventListener( 'disconnected', controllerDisconnected );
+	controllerGrip1.add( controllerModelFactory.createControllerModel( controllerGrip1 ) );
+	scene.add( controllerGrip1 );
+
+	controllerGrip2 = renderer.xr.getControllerGrip( 1 );
+	controllerGrip2.addEventListener( 'connected', controllerConnected );
+	controllerGrip2.addEventListener( 'disconnected', controllerDisconnected );
+	controllerGrip2.add( controllerModelFactory.createControllerModel( controllerGrip2 ) );
+	scene.add( controllerGrip2 );
+	
+	//TODO: GUI
+/*
+	guiScene = new THREE.Scene();
+	guiScene.background = new THREE.Color( 0x0 );
+	guiCamera = new THREE.OrthographicCamera( -1, 1, 1, -1, 0, 1 );
+	guiScene.add( guiCamera );
+console.log(`Init: valsOptions`);
+	valsOptions = {
+		Volume: .5, KeyShift: 0, Size: 1, Instrument: 'Harp', q: 3
+	};
+	const gui = new GUI( { width: 500 } );
+		gui.add( valsOptions, 'Volume',   0,  1, .5).onChange( optionChanged );
+		gui.add( valsOptions, 'KeyShift', -12,12, 0).onChange( optionChanged );
+		gui.add( valsOptions, 'Size',     0.1,2,  1).onChange( optionChanged );
+		gui.add( valsOptions, 'Instrument', ['Banjo', 'Harp', 'Koto', 'Panflute', 'Pop', 'Trombone', 'Whip', 'Wood'], 'Harp').onChange( optionChanged );
+		gui.add( valsOptions, 'Scale', {
+			Chromatic:			'0,1,2,3,4,5,6,7,8,9,10,11',
+			MajorPentatonic:	'0,2,4,7,9',
+			MinorPentatonic:	'0,3,5,7,10',
+			DiatonicMajor:		'0,2,4,5,7,9,11',
+			NaturalMinor:		'0,2,3,5,7,8,10',
+			HarmonicMajor:		'0,2,4,5,7,8,11',
+			HarmonicMinor:		'0,2,3,5,7,8,11'
+		}, '0,2,4,5,7,9,11').onChange( scaleChanged );
+		ctrlChords = gui.add( valsOptions, 'Chord', {
+			I: '0,4,7',
+		}, '0,4,7').onChange( chordChanged );
+	gui.domElement.style.visibility = 'hidden';
+	guiGroup = new InteractiveGroup();
+	guiScene.add( guiGroup );
+	const meshOptions = new HTMLMesh( gui.domElement );
+//	meshOptions.scale.set(1,1,1);
+	meshOptions.scale.set(2,2,2);
+	meshOptions.position.set(0, 0, 0);//x,y,z = right,up,back
+	guiGroup.add( meshOptions );
+	const bbox = new THREE.Box3().setFromObject( guiScene );
+	if (renderer.xr.isPresenting === true) {
+		guiLayer = renderer.xr.createQuadLayer( 1.2, .8, new THREE.Vector3(1.5, 1.5, -1.5), new THREE.Quaternion(), 1280, 800, renderGui );
+		scene.add( guiLayer );
+	}
+	guiGroup.position.set(0, 1.25, -.75);//x,y,z = right,up,back
+	guiCamera.left   = -.5;
+	guiCamera.right  =  .5;
+	guiCamera.top    =  .5;
+	guiCamera.bottom = -.5;
+	guiCamera.updateProjectionMatrix();
+//	scene.add(guiGroup);	//Omit until working on this again
+//*/
+	
+	//Listeners
+	window.addEventListener( 'resize', onWindowResize );
+	window.addEventListener('pointermove', onPointerMove);
+	window.addEventListener('click', () => {
+		if (listener.context.state === 'suspended') {
+			listener.context.resume();
+		}
+		if (AUDIO.state === 'suspended') {
+			AUDIO.resume();
+		}
+	});
+	
+	//Sound
+console.log(`Loading ${valsOptions.Instrument}`);	//Nope, hardcoding until the options UI works
+	loadSound(`sounds/Harp.wav`, function(buffer){//Banjo, Clarinet, French Horn, Harp, Trombone
+		BUFFER = buffer;
+		const note = getBufferNoteFloat( BUFFER );
+		INSTRUMENT_NATIVE_NOTE = mod12( note );
+	});
+	
+	mouseOscillator = listener.context.createOscillator();
+	mouseOscillator.type = 'sine';
+	mouseOscillator.start();
+
+	mouseAudio = new THREE.PositionalAudio(listener);
+	mouseAudio.setNodeSource(mouseOscillator);
+	mouseAudio.setRefDistance(20);
+	mouseAudio.setVolume(0);
+
+	camera.add(mouseAudio); //Attach to camera
+	
+	updateNotePositions();
+} //init
+
+function optionChanged(val) {
+	console.log("optionChanged");
+	//Size
+	nodeGroup.scale.setScalar(valsOptions.Size);
+} //optionChanged
+
+function scaleChanged(val) {
+	console.log("scaleChanged");
+	//Scale
+	SCALE_ST = valsOptions.Scale.split(",").map(x => parseInt(x));
+console.log(SCALE_ST);
+	//Repop Chords
+	gui.remove(ctrlChords);
+	let objChordOptions = {};
+	for ( let i=0; i<SCALE_ST.length; i++ ) {
+		let roman = intToRoman(i);
+		const note1 = SCALE_ST[i];
+		const note2 = SCALE_ST[mod12(i+1)];
+		const note3 = SCALE_ST[mod12(i+2)];
+		objChordOptions[roman] = `${note1},${note2},${note3}`;
+console.log(objChordOptions[roman]);
+	}
+	ctrlChords = gui.add(valsOptions, 'Chord', objChordOptions).onChange( chordChanged );
+}; //scaleChanged
+
+function chordChanged(val) {
+	console.log("chordChanged");
+	CHORD_ST = valsOptions.Chord.split(",").map(x => parseInt(x));
+console.log(CHORD_ST);
+} //chordChanged
+
+function updateNotePositions() {
+	nodeGroup.children.forEach(node => {
+		const note = node.userData.note;
+		const inScale = noteIsInScale(note, SCALE_ST);
+		const inChord = noteIsInScale(note, CHORD_ST);
+	//	node.position.z     = (inScale ? .1 : 0) + (inChord ? .05 : 0);	//Raise relevant notes	//TODO: Slide to position
+		node.userData.zDest = (inScale ? nodeSpace : 0) + (inChord ? nodeSpace : 0);	//Raise relevant notes
+		node.scale.setScalar( (inScale ? 1.1 : 1) * (inChord ? 1.1 : 1) );	
+		//TODO: Update colors based on inScale
+	});
+} //updateNotePositions
+
+function onPointerMove(event) {
+	mouse.x =  (event.clientX / window.innerWidth ) * 2 - 1;
+	mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+} //init
+
+function createTextTexture(text, foreColor, backColor) {
+	const canvas = document.createElement('canvas');
+	canvas.width = 256;
+	canvas.height = 128;
+	const ctx = canvas.getContext('2d');
+	ctx.clearRect(0, 0, canvas.width, canvas.height);
+	if ( backColor ) {
+		ctx.fillStyle = backColor;
+		ctx.fillRect(0, 0, canvas.width, canvas.height);
+	}
+	if ( foreColor ) {
+		ctx.fillStyle = foreColor;
+		ctx.font = '42px Helvetica';
+		ctx.textAlign = 'center';
+		ctx.textBaseline = 'middle';
+		ctx.setTransform(1.5, 0, 0, 1, 0, 0); // scale X by 1.5
+		ctx.fillText(text, canvas.width / 2 / 1.5, canvas.height / 2);
+	//	ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+	}
+	const texture = new THREE.CanvasTexture(canvas);
+	texture.encoding = THREE.sRGBEncoding;
+	texture.needsUpdate = true;
+	return texture;
+} //createTextTexture
+
+function controllerConnected( event ) {
+	const oscillator = listener.context.createOscillator();
+	oscillator.type = 'sine';
+	oscillator.start();
+	const audio = new THREE.PositionalAudio( listener );
+	audio.setNodeSource( oscillator );
+	audio.setRefDistance( 20 );
+	audio.setVolume( 0 );
+	this.userData.gamepad = event.data.gamepad;
+	this.userData.colliding = false;
+	this.userData.audio = audio;
+	this.add( audio );
+	controllerGrips.push(this);
+	console.log("Controller connected");
+}
+
+function controllerDisconnected() {
+	const audio = this.userData.audio;
+	audio.source.stop();
+	this.remove( audio );
+	controllerGrips = controllerGrips.filter(controller => controller !== this);
+	console.log("Controller disconnected");
+}
+
+function onWindowResize() {
+	camera.aspect = window.innerWidth / window.innerHeight;
+	camera.updateProjectionMatrix();
+	renderer.setSize( window.innerWidth, window.innerHeight );
+} //onWindowResize
+
+//How about now?:
+function handleControllers() {
+	if (controllerGrips.length==0)
+		return;
+
+	//Picks
+	const pickOffset = new THREE.Vector3(0, 0, -0.1);//x,y,z = right,up,back
+	if (controllerGrip1) {
+		objPick1.visible = renderer.xr.isPresenting;
+        objPick1.quaternion.copy(controllerGrip1.quaternion);
+		const pickOffset1 = pickOffset.clone().applyQuaternion(controllerGrip1.quaternion);
+        objPick1.position.copy(controllerGrip1.position).add(pickOffset1);
+    }
+	if (controllerGrip2) {
+		objPick2.visible = renderer.xr.isPresenting;
+        objPick2.quaternion.copy(controllerGrip2.quaternion);
+		const pickOffset2 = pickOffset.clone().applyQuaternion(controllerGrip2.quaternion);
+        objPick2.position.copy(controllerGrip2.position).add(pickOffset2);
+    }
+	
+	//Node collisions
+	nodeGroup.children.forEach(node => {
+		const note = node.userData.note;
+		box.setFromObject(node);
+		const boxPick1 = new THREE.Box3().setFromObject(objPick1);
+		const boxPick2 = new THREE.Box3().setFromObject(objPick2);
+		let intersects = false;
+		let hitController = null;
+	/*
+		controllerGrips.forEach(controller => {
+			const sphere = {radius: 0.03, center: controller.position};
+			if (box.intersectsSphere(sphere)) {
+				intersects = true;
+				hitController = controller;
+			}
+		}); //for controller
+	/*/
+		if (controllerGrip1 && box.intersectsBox(boxPick1)) {
+	//	if (controllerGrip1 && meshIntersectsMesh(box, boxPick1) ) {
+			intersects = true;
+			hitController = controllerGrip1;
+		}
+		if (controllerGrip2 && box.intersectsBox(boxPick2)) {
+	//	if (controllerGrip2 && meshIntersectsMesh(box, boxPick2) ) {
+			intersects = true;
+			hitController = controllerGrip2;
+		}
+	//*/
+		
+		//Test
+		if (intersects) {
+			if (SOUND_MODE === "oscillator") {
+//console.log(`handleController: oscillator, note=${note}`);
+				//Sound
+				oscillator.frequency.value = noteToFreq(note);
+				node.userData.audio.setVolume(0.5);
+				//Visual feedback
+				node.material.forEach(mat => { if (mat.emissive) mat.emissive.b = 1; });
+				node.scale.setScalar(1 + Math.random() * 0.1);
+				//Haptic feedback
+				if (hitController?.userData?.gamepad?.hapticActuators?.length > 0) {
+					hitController.userData.gamepad.hapticActuators[0].pulse(1.0, 100);	//intensity
+				}
+			}
+			else if (SOUND_MODE === "sample" && !node.userData.triggered) {	//TODO: Fix triggering
+				node.userData.triggered = true;	//Trigger once per node
+//console.log(`handleController: sample, note=${node.userData.note} triggered`);
+				//Sound
+				playSound(BUFFER, 0, semitonesToFreqCoeff(note-INSTRUMENT_NATIVE_NOTE), 0);
+				//Visual feedback
+				node.material.forEach(mat => { if (mat.emissive) mat.emissive.b = 1; });
+				node.scale.setScalar(1 + Math.random() * 0.1);
+				//Haptic feedback
+				if (hitController.userData.gamepad.hapticActuators?.length > 0) {
+					hitController.userData.gamepad.hapticActuators[0].pulse(1.0, 100);	//intensity
+				}
+			}
+			
+		}
+		else {
+			//Clear trigger
+			if (node.userData.triggered) {
+				node.userData.triggered = false;	//I think the other controller clears it again
+//console.log(`handleController: clear, note=${node.userData.note}`);
+			}
+			//Sound
+			if (SOUND_MODE === "oscillator")
+			//	oscillator.setVolume(0);
+				node.userData.audio.setVolume(0.5);
+			//Visual feedback
+			node.material.forEach(mat => { if (mat.emissive) mat.emissive.b = 0; });
+			node.scale.setScalar(1);
+		}
+	}); //for node
+} //handleController
+
+function handleMouseHover() {
+	raycaster.setFromCamera(mouse, camera);
+	const intersects = raycaster.intersectObjects(nodeGroup.children);
+
+	nodeGroup.children.forEach(node => {
+		let note = node.userData.note;	//Note 0 is C3
+		//Test
+		if (intersects.some(hit => hit.object === node)) {
+			if (SOUND_MODE=="oscillator") {
+//console.log(`handleMouseHover: oscillator, note=${note}`);
+				//Sound
+				mouseOscillator.frequency.value = noteToFreq(note);//110 * Math.pow(2, musicInterval / 12);
+				mouseAudio.setVolume(0.5);
+				//Visual feedback
+				node.material.forEach(mat => {if (mat.emissive) mat.emissive.b = 1;});
+				const intensity = 1;
+				node.scale.setScalar(1 + Math.random() * 0.1 * intensity);	//Randomizes height scalar while touched
+			}
+			else if (SOUND_MODE=="sample" && !node.userData.triggered) {
+				node.userData.triggered = true;
+//console.log(`handleMouseHover: sample, note=${note}`);
+				//Sound
+				playSound( BUFFER, 0, semitonesToFreqCoeff(note-INSTRUMENT_NATIVE_NOTE), 0 );	//Why both params?
+				//Visual feedback
+				node.material.forEach(mat => {if (mat.emissive) mat.emissive.b = 1;});
+				const intensity = 1;
+				node.scale.setScalar(1 + Math.random() * 0.1 * intensity);	//Randomizes height scalar while touched
+			}
+		}
+		else {
+			//Clear trigger
+			if (node.userData.triggered) {
+				node.userData.triggered = false;
+//console.log(`handleMouseHover: clear, note=${node.userData.note}`);
+			}
+			//Sound
+			if( SOUND_MODE=="oscillator" )
+				mouseAudio.setVolume(0);
+			//Visual feedback
+			node.material.forEach(mat => { if (mat.emissive) mat.emissive.b = 0; });
+			node.scale.setScalar(1);
+		}
+	
+	});
+} //handleMouseHover
+
+function animate(time) {
+	const dt = (time - lastTime) * 0.001; // seconds since last frame
+	lastTime = time;
+	
+	handleControllers();
+	if (!renderer.xr.isPresenting) {
+		handleMouseHover();
+	}
+	
+	const lerpSpeed = 0.2;
+	nodeGroup.children.forEach(node => {
+		const zDest = node.userData.zDest ?? node.position.z;
+		node.position.z += (zDest - node.position.z) * lerpSpeed;
+	});
+	
+	const measureSeconds = 2.0;
+	const wallSpeed = 1.0/measureSeconds;//m/s
+	if (objWall) {
+	//	objWall.position.z += wallSpeed * dt;
+	//	if(objWall.position.z > nodeGroup.position.z) {
+	//		objWall.position.z = nodeGroup.position.z-1;
+		objWall.position.y -= wallSpeed * dt;
+		if(objWall.position.y < nodeGroup.position.y) {
+			objWall.position.y = nodeGroup.position.y+1;
+			PROGRESSION_INDEX = (PROGRESSION_INDEX+1)%PROGRESSION.length;
+			CHORD_ST = PROGRESSION[PROGRESSION_INDEX];
+			updateNotePositions();
+		}
+	}
+	//Render
+	renderer.render(scene, camera);		// WebGL
+} //animate
+
+function renderGui() {
+	renderer.render( guiScene, guiCamera );
+}
+
+		</script>
+	</body>
+</html>

@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>three.js xr - haptics</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+		<link type="text/css" rel="stylesheet" href="main.css">
+	</head>
+	<body>
+		<div id="info">
+			<a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> xr - haptics
+		</div>
+
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "../build/three.module.js", "three/addons/": "./jsm/"
+				}
+			}
+		</script>
+
+		<script language="javascript" src="pitchshift.js"></script>
+		<script language="javascript" src="dsp.js"></script>
+		<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { XRButton } from 'three/addons/webxr/XRButton.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+let container;
+let camera, scene, renderer;
+let listener;
+let controller1, controller2;
+let controllerGrip1, controllerGrip2;
+const box = new THREE.Box3();
+let controls, group;					window.controls = controls;	window.group = group;
+
+let raycaster = new THREE.Raycaster();	window.raycaster = raycaster;
+let mouse = new THREE.Vector2();		window.mouse = mouse;
+let INTERSECTED = null;
+let mouseAudio;
+let mouseOscillator;
+let objWall;
+let lastTime = 0;
+
+let iOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+let NOTE_NAMES_12 = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+let NOTE_NAMES_24 = ["C","C\u2021","C#","D\u2422","D","D\u2021","D#","E\u2422","E","E\u2021","F","F\u2021",
+					 "F#","G\u2422","G","G\u2021","G#","A\u2422","A","A\u2021","A#","B\u2422","B","B\u2021"];
+let NUM_COLS = 25;
+let NUM_NOTES = 12;	//12 TET
+let AUDIO = iOS ? new webkitAudioContext() : new AudioContext();
+let GAIN = AUDIO.createGain();
+GAIN.connect( AUDIO.destination );
+let ANALYSER = AUDIO.createAnalyser();
+let BUFFERS = [];	//Stores instrument buffers
+let SOURCES = [];	//Stores instances of sound sources
+let TUNING_ST = [-20,-15,-10,-5,-1,4];
+let SCALE_ST  = [0,2,4,5,7,9,11];
+let CHORD_ST  = [0,4,7];
+let SHIFT_ST = 0;
+let ECHO = false;
+let SOUND_MODE = "sample";//oscillator, sample
+let INSTRUMENT_NATIVE_NOTE = 0;
+let SCALE_TOLERANCE_ST = 0.15;
+let FFT_SIZE = 2048;//4096;
+let FFT_FRAGMENTS = 4;//8
+
+function mod12(note){
+	return (note + 1000*12) % 12;
+} //mod12
+
+function semitonesToFreqCoeff(shift){
+	return Math.pow(2, shift/12);
+} //semitonesToFreqCoeff
+function freqCoeffToSemitones(freqCoeff){
+	return 12*Math.log2(freqCoeff);
+} //freqCoeffToSemitones
+
+function noteToCssRgb1(note, inScale){
+	var phase = -2*Math.PI * note/12;
+	var r = (Math.cos(phase+Math.PI*(0/3+1/6))+1)/2;
+	var g = (Math.cos(phase+Math.PI*(2/3+1/6))+1)/2;
+	var b = (Math.cos(phase+Math.PI*(4/3+1/6))+1)/2;
+	r = inScale ? (1+r)/2 : r/2;
+	g = inScale ? (1+g)/2 : g/2;
+	b = inScale ? (1+b)/2 : b/2;
+	r = parseInt(r*255),	g = parseInt(g*255),	b = parseInt(b*255);
+	return "rgb("+r+", "+g+", "+b+")";
+} //noteToCssRgb1
+function noteToCssRgb2(note, inScale){
+	return $.Color({ hue: 360*mod12(-note)/12 , saturation:inScale?1:1, lightness: inScale?0.5:0.2 }).toString();
+} //noteToCssRgb2
+let noteToCssRgb = noteToCssRgb1;
+
+function noteToThreeColor(note, inScale){
+	var phase = -2*Math.PI * note/12;
+	var r = (Math.cos(phase+Math.PI*(0/3+1/6))+1)/2;
+	var g = (Math.cos(phase+Math.PI*(2/3+1/6))+1)/2;
+	var b = (Math.cos(phase+Math.PI*(4/3+1/6))+1)/2;
+	r = inScale ? (1+r)/2 : r/2;
+	g = inScale ? (1+g)/2 : g/2;
+	b = inScale ? (1+b)/2 : b/2;
+	return new THREE.Color( r, g, b );
+} //noteToThreeColor
+
+function noteToName(note){
+	var index = NOTE_NAMES_24.length * mod12(note)/12;
+	if( index.toFixed(2) != Math.round(index.toFixed(2)) )
+		return "";
+	return NOTE_NAMES_24[ index ];
+}//noteToName
+
+function nameToNote(name){
+	for(var note=0; note<NOTE_NAMES_24.length; note++)
+		if( NOTE_NAMES_24[note]==name.toUpperCase() )
+			return note;
+	return -1;
+}//nameToNote
+
+function noteIsInScale(note, scale){
+	if(!scale)	scale = SCALE_ST;
+	var st = mod12(note - SHIFT_ST);	//
+	for(var i=0; i<scale.length; i++)
+		if( Math.abs(st - mod12(scale[i])) < SCALE_TOLERANCE_ST 
+		 || Math.abs(st - 12 - mod12(scale[i])) < SCALE_TOLERANCE_ST )
+			return true;
+	return false;
+} //noteIsInScale
+
+function notesAreInScale(notes, scale){
+	if(!scale)	scale = SCALE_ST;
+	var inScale = true;
+	for(var n=0; n<notes.length; n++)
+		if( !noteIsInScale(notes[n], scale) )
+			inScale = false;
+	return inScale;
+} //notesAreInScale
+
+AudioBufferSourceNode.prototype.setStartTime = function(){
+	this.startTime = this.context.currentTime;
+} //setStartTime
+AudioBufferSourceNode.prototype.scaleFrequencyViaPlayback = function(freqCoeff){
+	this.playbackRate.value = freqCoeff;
+} //scaleFrequencyViaPlayback
+AudioBufferSourceNode.prototype.progress = function(){
+	//NOTE: Factoring in playback rate
+	var progress = this.startTime ? (this.context.currentTime - this.startTime)*this.playbackRate.value / this.buffer.duration : 0;
+	if(progress >1)	progress = 1;
+	return progress;
+} //progress
+
+Pitchshift.prototype.analyze = function(numSampsToProcess, osamp, indata){
+	function setArray(array, length, val) {
+		var intLength = Math.floor(length);
+		for (var i = 0; i < intLength; i++)
+			array[i] = val;
+	}
+	//PitchShift: factor value which is between 0.5 (one octave down) and 2. (one octave up).
+	var fftFrameSize2 = this.fftFrameSize_ / 2, stepSize = this.fftFrameSize_ / osamp,
+		freqPerBin = this.sampleRate_ / this.fftFrameSize_, expct = 2. * Math.PI * stepSize / this.fftFrameSize_,
+		inFifoLatency = this.fftFrameSize_ - stepSize, j, k = 0, magn, phase, tmp, qpd, index, signal;
+	if (this.gRover_ === false)
+		this.gRover_ = inFifoLatency;
+	//Main processing loop
+	for (let j = 0; j < numSampsToProcess; j++) {
+		//As long as we have not yet collected enough data just read in
+		this.gInFIFO[this.gRover_] = indata[j];
+		this.outdata[j] = this.gOutFIFO[this.gRover_ - inFifoLatency];
+		this.gRover_++;
+		//We have enough data for processing
+		if (this.gRover_ >= this.fftFrameSize_) {
+			this.gRover_ = inFifoLatency;
+			//Windowing
+			for (let k = 0; k < this.fftFrameSize_; k++)
+				this.gFFTworksp[k] = this.gInFIFO[k] * this.hannWindow_[k];
+			this.fft.forward(this.gFFTworksp);
+			//Analysis
+			for (let k = 0; k <= fftFrameSize2; k++) {
+				if (this.algo === "FFT") {
+					magn = 2 * Math.sqrt(this.fft.real[k] * this.fft.real[k] + this.fft.imag[k] * this.fft.imag[k]);
+					phase = Math.atan2(this.fft.imag[k], this.fft.real[k]);
+				} else if (this.algo === "RFFT") {
+					var imaginary, real;
+					real = this.fft.trans[k];
+					imaginary = k==0 ? 0 : this.fft.trans[this.fftFrameSize_ - k];
+					magn = 2 * Math.sqrt(real * real + imaginary * imaginary);
+					phase = Math.atan2(imaginary, real);
+				} else {
+					throw new Error("Invalid DFT algorithm selected " + this.algo);
+				}
+				//Compute and subtract phase difference
+				tmp = phase - this.gLastPhase[k];
+				this.gLastPhase[k] = phase;
+				tmp -= k * expct;
+				//Map delta phase into +/- Pi interval
+				qpd = tmp / Math.PI;
+				if (qpd >= 0) {
+					qpd = Math.floor(qpd);
+					/* This probably won't work like in C */
+					qpd += qpd & 1;
+				} else {
+					qpd = Math.ceil(qpd);
+					qpd -= qpd & 1;
+				}
+				tmp -= Math.PI * qpd;
+				//Get deviation from bin frequency from the +/- Pi interval
+				tmp = osamp * tmp / (2 * Math.PI);
+				//Compute the k-th partials' true frequency
+				tmp = k * freqPerBin + tmp * freqPerBin;
+				//Store magnitude and true frequency in analysis arrays
+				this.gAnaMagn[k] = magn;
+				this.gAnaFreq[k] = tmp;
+			}
+		}
+	} //for numSampsToProcess
+	//this.gAnaFreq stores frequencies
+	//this.gAnaMagn stores magnitudes
+} //analyze
+
+function getBufferNoteFloat(buffer){
+	//Simplify calculation by just analyzing largest 2^n sample within first channel
+	var sampleSize = Math.pow(2, Math.floor( Math.log2( buffer.getChannelData(0).length ) ) );	
+	var shifter = new Pitchshift( FFT_SIZE, buffer.sampleRate, 'FFT' );
+	shifter.analyze( buffer.getChannelData(0).length, 1, buffer.getChannelData(0) );	
+	//Find strongest frequency
+	var iMax=0, max = 0;
+	for(let i=1; i<shifter.gAnaMagn.length/2; i++){	//Only concern with the 1st half of the DFT, but not 0 Hz
+		if(shifter.gAnaMagn[i] > max){
+			max = shifter.gAnaMagn[i];
+			iMax = i;
+		}
+	}
+	var freq = shifter.gAnaFreq[iMax];
+	if( isNaN(freq) || !isFinite(freq) )	//Failsafe if analysis is a bust
+		return 0;
+	//+-23.4 Hz for sample rate 48000 and DFT size 2048, 24 kHz max
+	//Use adjacent samples to parabolically estimate an approximation for INSTRUMENT_NATIVE_NOTE
+	if( iMax-1>=0 && iMax+1<shifter.gAnaMagn.length ){
+		var f1, f2, f3, y1, y2, y3, a, b, c;
+		f1 = shifter.gAnaFreq[iMax-1], f2 = shifter.gAnaFreq[iMax], f3 = shifter.gAnaFreq[iMax+1];
+		y1 = shifter.gAnaMagn[iMax-1], y2 = shifter.gAnaMagn[iMax], y3 = shifter.gAnaMagn[iMax+1];
+		c = y2, b = (y3-y1)/2, a = y3 - b - y2;
+		var offset = -b/a;
+		freq = f2 + offset*( offset>0 ? f3-f2 : f2-f1 );
+	}
+//	log( "getBufferNoteFloat: "+freq.toFixed(2) +" Hz, "+ mod12(12*Math.log2(freq/440)-3).toFixed(2)+" st" );
+	return NUM_NOTES*Math.log2(freq/440)-3;
+} //getBufferNoteFloat
+
+function loadSound(url, callback){
+	var request = new XMLHttpRequest();
+	request.open("GET", url, true);
+	request.responseType = "arraybuffer";
+	request.onload = function(){
+		try{
+			AUDIO.decodeAudioData( request.response, function(buffer){ if(callback) callback(buffer); } );
+		}catch(ex){}
+	}
+	request.send();
+} //loadSound
+
+//var period = 60/(BPM*NPB), tNext = Math.ceil(AUDIO.currentTime / period)*period + tickDelay*period;//0
+//SOURCE_CUR = playSound( SHIFTED_BUFFERS[instrument][oct-SHIFTED_BUFFERS_MIN], tNext, semitonesToFreqCoeff(shift - INSTRUMENT_NATIVE_NOTE), note2 );
+function playSound(buffer, time, freqCoeff, note){
+	try{
+		time = time ? time : 0;
+		note = note ? note : 0;
+		var source = AUDIO.createBufferSource();	//Sound source
+		source.buffer = buffer;
+	//	source.connect( AUDIO.destination );	//Destination = Speakers
+	//	source.connect( GAIN );	//SOURCE - GAIN - DESTINATION (Speakers)
+		GAIN.gain.value = 0.1;
+		
+		if(ECHO){
+			var delay = AUDIO.createDelay();
+			delay.delayTime.value = 60/BPM;
+			var feedback = AUDIO.createGain();
+			feedback.gain.value = 0.5;
+			delay.connect(feedback);
+			feedback.connect(delay);
+			source.connect(delay);
+			delay.connect(GAIN);
+		}
+		source.connect(GAIN);
+		
+		source.scaleFrequencyViaPlayback( freqCoeff );
+		source.note = note;
+//		source.octaveIndex = parseInt(note/SHIFTED_BUFFERS_INTERVAL_ST);
+		source.setStartTime();	//Extend to hold startTime
+		source.start( time );	//Schedules when time==AUDIO.currentTime seconds
+		SOURCES.push( source );
+		return source;
+	}catch(ex){
+		console.log(ex);
+		return null;
+	}
+} //playSound
+
+
+
+
+init();
+
+function init() {
+	container = document.createElement( 'div' );
+	document.body.appendChild( container );
+
+	scene = new THREE.Scene();
+	scene.background = new THREE.Color( 0x808080 );
+
+	camera = new THREE.PerspectiveCamera( 50, window.innerWidth / window.innerHeight, 0.1, 10 );
+	camera.position.set( 0, 1.6, 3 );
+
+	listener = new THREE.AudioListener();
+	camera.add( listener );
+
+	controls = new OrbitControls( camera, container );
+	controls.target.set( 0, 1.6, 0 );
+	controls.update();
+
+	const floorGeometry = new THREE.PlaneGeometry( 4, 4 );
+	const floorMaterial = new THREE.ShadowMaterial( { opacity: 0.25, blending: THREE.CustomBlending, transparent: false } );
+	const floor = new THREE.Mesh( floorGeometry, floorMaterial );
+	floor.rotation.x = - Math.PI / 2;
+	floor.receiveShadow = true;
+	scene.add( floor );
+
+	scene.add( new THREE.HemisphereLight( 0xbcbcbc, 0xa5a5a5, 3 ) );
+
+	const light = new THREE.DirectionalLight( 0xffffff, 3 );
+	light.position.set( 0, 6, 0 );
+	light.castShadow = true;
+	light.shadow.camera.top = 2;
+	light.shadow.camera.bottom = - 2;
+	light.shadow.camera.right = 2;
+	light.shadow.camera.left = - 2;
+	light.shadow.mapSize.set( 4096, 4096 );
+	scene.add( light );
+
+	//x,y,z = right,up,fore
+	group = new THREE.Group();
+	group.position.z = - 0.5;	//1/2 m in front of user
+	scene.add( group );
+	
+	loadSound("sounds/"+"Trombone.wav", function(buffer){//Banjo, Clarinet, French Horn, Trombone
+		BUFFERS.push(buffer);
+		INSTRUMENT_NATIVE_NOTE = mod12( getBufferNoteFloat( BUFFERS[0] ) );
+	});
+	
+	//My guitar grid
+	//<option value='-20,-15,-10,-5,-1,4'>Guitar EADGBE Standard</option>
+	//<option numnotes='12' value='0,2,4,7,9' selected='selected' >Major Pentatonic Scale</option>
+	//<option numnotes='12' value='0,2,4,5,7,9,11'>Diatonic Major Scale</option>
+	for (let i=0; i<TUNING_ST.length; i++) {
+		for (let j=0; j<NUM_COLS; j++) {
+			const intensity = 1.0;
+			const size = .08;
+			const note = TUNING_ST[i] + j;
+			const noteName = noteToName(note);
+			const inScale = noteIsInScale(note, SCALE_ST);
+			const inChord = noteIsInScale(note, CHORD_ST);
+			const noteColor = noteToCssRgb(note, inScale);
+			const noteColor3 = noteToThreeColor(note, inScale);
+			
+			const geometry = new THREE.BoxGeometry( size, size, size );
+		//	geometry.translate( 0, h/2, 0 );//Set mesh origin to bottom
+			const textTexture = createTextTexture(noteName, 'black', noteColor);
+			const baseMaterial = new THREE.MeshStandardMaterial({
+				color: noteColor3, roughness: 0.7, metalness: 0.0
+			});
+			const textMaterial = new THREE.MeshStandardMaterial({
+				map: textTexture, //transparent: true,
+			//	map: null, alphaMap: textTexture,
+				roughness: 0.7, metalness: 0.0
+			});
+			const materials = [baseMaterial,baseMaterial,baseMaterial,baseMaterial,textMaterial, baseMaterial];//R,L,Top,Bot,Front,Back
+
+			const object = new THREE.Mesh(geometry, materials);
+		//	const object = new THREE.Mesh(geometry, material );
+			object.userData.baseMaterial = baseMaterial;
+			
+			object.position.x = (j - 12) * .1;	//x,y,z = right,up,fore //Use inScale
+			object.position.y = (i -  3) * .1 + 1;	//Start 1m above floor
+			object.position.z = (inScale ? .1 : 0) + (inChord ? .05 : 0);	//Raise relevant notes
+			object.castShadow = true;
+			object.receiveShadow = true;
+			object.userData = {
+				index: i + 1,
+				note: note,
+				intensity: intensity
+			};
+			group.add( object );
+		}
+	}
+	
+	const geoWall = new THREE.BoxGeometry( 2.5, .6, .01 );	//x,y,z = right,up,fore
+	const matWall = new THREE.MeshStandardMaterial({
+		color: "white", roughness: 0.5, metalness: 0.0, transparent: true, opacity: 0.1
+	});
+	objWall = new THREE.Mesh(geoWall, matWall);
+	objWall.position.y =  1;//x,y,z = right,up,fore
+	objWall.position.z = group.position.z-1;
+	scene.add( objWall );
+
+	//
+	renderer = new THREE.WebGLRenderer( { antialias: true } );
+	renderer.setPixelRatio( window.devicePixelRatio );
+	renderer.setSize( window.innerWidth, window.innerHeight );
+	renderer.setAnimationLoop( animate );
+	renderer.shadowMap.enabled = true;
+	renderer.xr.enabled = true;
+	container.appendChild( renderer.domElement );
+	document.body.appendChild( XRButton.createButton( renderer ) );
+
+	// controllers
+	controller1 = renderer.xr.getController( 0 );
+	scene.add( controller1 );
+	controller2 = renderer.xr.getController( 1 );
+	scene.add( controller2 );
+
+	const controllerModelFactory = new XRControllerModelFactory();
+
+	controllerGrip1 = renderer.xr.getControllerGrip( 0 );
+	controllerGrip1.addEventListener( 'connected', controllerConnected );
+	controllerGrip1.addEventListener( 'disconnected', controllerDisconnected );
+	controllerGrip1.add( controllerModelFactory.createControllerModel( controllerGrip1 ) );
+	scene.add( controllerGrip1 );
+
+	controllerGrip2 = renderer.xr.getControllerGrip( 1 );
+	controllerGrip2.addEventListener( 'connected', controllerConnected );
+	controllerGrip2.addEventListener( 'disconnected', controllerDisconnected );
+	controllerGrip2.add( controllerModelFactory.createControllerModel( controllerGrip2 ) );
+	scene.add( controllerGrip2 );
+	//
+	window.addEventListener( 'resize', onWindowResize );
+	
+	window.addEventListener('pointermove', onPointerMove);
+	
+	window.addEventListener('click', () => {
+		if (listener.context.state === 'suspended') {
+			listener.context.resume();
+		}
+		if (AUDIO.state === 'suspended') {
+			AUDIO.resume();
+		}
+	});
+	
+	mouseOscillator = listener.context.createOscillator();
+	mouseOscillator.type = 'sine';
+	mouseOscillator.start();
+
+	mouseAudio = new THREE.PositionalAudio(listener);
+	mouseAudio.setNodeSource(mouseOscillator);
+	mouseAudio.setRefDistance(20);
+	mouseAudio.setVolume(0);
+
+	camera.add(mouseAudio); // attach to camera
+}
+
+function onPointerMove(event) {
+	mouse.x =  (event.clientX / window.innerWidth ) * 2 - 1;
+	mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+} //init
+
+function createTextTexture(text, foreColor, backColor) {
+	const canvas = document.createElement('canvas');
+	canvas.width = 256;
+	canvas.height = 128;
+	const ctx = canvas.getContext('2d');
+	ctx.clearRect(0, 0, canvas.width, canvas.height);
+	if ( backColor ) {
+		ctx.fillStyle = backColor;
+		ctx.fillRect(0, 0, canvas.width, canvas.height);
+	}
+	if ( foreColor ) {
+		ctx.fillStyle = foreColor;
+		ctx.font = '42px Helvetica';
+		ctx.textAlign = 'center';
+		ctx.textBaseline = 'middle';
+		ctx.setTransform(1.5, 0, 0, 1, 0, 0); // scale X by 1.5
+		ctx.fillText(text, canvas.width / 2 / 1.5, canvas.height / 2);
+	//	ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+	}
+	const texture = new THREE.CanvasTexture(canvas);
+	texture.encoding = THREE.sRGBEncoding;
+	texture.needsUpdate = true;
+	return texture;
+}
+
+function controllerConnected( event ) {
+	const oscillator = listener.context.createOscillator();
+	oscillator.type = 'sine';
+	oscillator.start();
+	const audio = new THREE.PositionalAudio( listener );
+	audio.setNodeSource( oscillator );
+	audio.setRefDistance( 20 );
+	audio.setVolume( 0 );
+	this.userData.gamepad = event.data.gamepad;
+	this.userData.colliding = false;
+	this.userData.audio = audio;
+	this.add( audio );
+}
+
+function controllerDisconnected() {
+	const audio = this.userData.audio;
+	audio.source.stop();
+	this.remove( audio );
+}
+
+function onWindowResize() {
+	camera.aspect = window.innerWidth / window.innerHeight;
+	camera.updateProjectionMatrix();
+	renderer.setSize( window.innerWidth, window.innerHeight );
+}
+
+function handleCollisions() {
+	for ( let i = 0; i < group.children.length; i ++ ) {
+		group.children[ i ].collided = false;
+	}
+
+	handleController( controllerGrip1 );
+	handleController( controllerGrip2 );
+
+	for ( let i = 0; i < group.children.length; i ++ ) {
+		const child = group.children[ i ];
+		if ( ! child.collided ) {
+			// reset uncollided boxes
+//			child.material.emissive.b = 0;
+//			child.userData.baseMaterial.emissive.b = 0;
+			child.material.forEach(mat => {if (mat.emissive) mat.emissive.b = 0;});
+			child.scale.setScalar( 1 );
+		}
+	}
+} //handleCollisions
+
+// minor pentatonic scale, so whichever notes is stricken would be more pleasant
+const musicScale = [ 0, 3, 5, 7, 10 ];	//TODO: Deprecate for SCALE_ST
+
+//TODO: Code repeats in mouseover handler
+function handleController( controller ) {
+	const wasColliding = controller.userData.colliding; // 👈 store previous
+	controller.userData.colliding = false;
+	const audio = controller.userData.audio;
+	const gamepad = controller.userData.gamepad;
+	if ( audio === undefined || gamepad === undefined )
+		return;
+	const oscillator = audio.source;
+	const supportHaptic = 'hapticActuators' in gamepad && gamepad.hapticActuators != null && gamepad.hapticActuators.length > 0;
+	const sphere = {
+		radius: 0.03,
+		center: controller.position
+	};
+
+	//Check each note for collision
+	for ( let i = 0; i < group.children.length; i ++ ) {
+		const child = group.children[ i ];
+		box.setFromObject( child );
+		if ( box.intersectsSphere( sphere ) ) {
+//			child.material.emissive.b = 1;
+//			child.userData.baseMaterial.emissive.b = 1;
+			child.material.forEach(mat => {if (mat.emissive) mat.emissive.b = 1;});
+			const intensity = 1;//child.userData.index / group.children.length;
+			child.scale.setScalar( 1 + Math.random() * 0.1 * intensity );	//Randomizes height scalar while touched
+			if ( supportHaptic ) {
+				gamepad.hapticActuators[0].pulse( intensity, 100 );	//What if we set this by control speed?
+			}
+			const note = child.userData.note;//musicScale[child.userData.index % musicScale.length] + 12 * Math.floor(child.userData.index / musicScale.length);
+			oscillator.frequency.value = 110 * semitonesToFreqCoeff(note+3);//Math.pow(2, musicInterval / 12);
+			controller.userData.colliding = true;
+			group.children[i].collided = true;
+		}
+	}
+
+	if (controller.userData.colliding && !wasColliding) {
+		if (SOUND_MODE == "sample") {
+			playSound(
+				BUFFERS[0], 0, semitonesToFreqCoeff(hitNote - INSTRUMENT_NATIVE_NOTE), 0
+			);
+		}
+	}
+	// continuous oscillator behavior
+	if (controller.userData.colliding) {
+		if (SOUND_MODE == "oscillator") {
+			audio.setVolume(0.5);
+		}
+	} else {
+		if (SOUND_MODE == "oscillator") {
+			audio.setVolume(0);
+		}
+	}
+} //handleController
+
+function handleMouseHover() {
+	raycaster.setFromCamera(mouse, camera);
+	const intersects = raycaster.intersectObjects(group.children);
+	if (intersects.length > 0) {
+		const object = intersects[0].object;
+		if (SOUND_MODE=="oscillator" || (SOUND_MODE=="sample" && INTERSECTED !== object)) {
+			// reset previous
+			if (INTERSECTED) {
+			//	INTERSECTED.material.emissive.b = 0;
+			//	INTERSECTED.userData.baseMaterial.emissive.b = 0;
+				INTERSECTED.material.forEach(mat => {if (mat.emissive) mat.emissive.b = 0;});
+				INTERSECTED.scale.setScalar(1);
+			}
+			INTERSECTED = object;
+		//	object.material.emissive.b = 1;
+		//	object.userData.baseMaterial.emissive.b = 1;
+			object.material.forEach(mat => {if (mat.emissive) mat.emissive.b = 1;});
+			const intensity = 1;//object.userData.index / group.children.length;
+			object.scale.setScalar(1 + Math.random() * 0.1 * intensity);	//Randomizes height scalar while touched
+
+			let note = object.userData.note;	//Note 0 is C3
+			mouseOscillator.frequency.value = 110 * semitonesToFreqCoeff(note+3);//110 * Math.pow(2, musicInterval / 12);
+			if( SOUND_MODE=="oscillator" )
+				mouseAudio.setVolume(0.5);
+			if( SOUND_MODE=="sample" ) {	//TODO: Only trigger on initial mouseover
+				playSound( BUFFERS[0], 0, semitonesToFreqCoeff(note - INSTRUMENT_NATIVE_NOTE), 0 );	//Why both params?
+			}
+		}
+	}
+	else {
+		if (INTERSECTED) {
+		//	INTERSECTED.material.emissive.b = 0;
+		//	INTERSECTED.userData.baseMaterial.emissive.b = 0;
+			INTERSECTED.material.forEach(mat => {if (mat.emissive) mat.emissive.b = 0;});
+			INTERSECTED.scale.setScalar(1);
+		}
+
+		if( SOUND_MODE=="oscillator" )
+			mouseAudio.setVolume(0);
+		INTERSECTED = null;
+	}
+} //handleMouseHover
+
+function animate(time) {
+	const dt = (time - lastTime) * 0.001; // seconds since last frame
+	lastTime = time;
+	
+	handleCollisions();
+	if (!renderer.xr.isPresenting) {
+		handleMouseHover();
+	}
+	
+	const wallSpeed = 1;//m/s
+	if (objWall) {
+		objWall.position.z += wallSpeed * dt;
+		if(objWall.position.z > group.position.z)
+			objWall.position.z = group.position.z-1;
+	}
+
+	renderer.render( scene, camera );
+} //animate
+			
+		</script>
+	</body>
+</html>

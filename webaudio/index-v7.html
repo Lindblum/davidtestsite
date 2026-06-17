@@ -1,0 +1,1052 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+	<head>
+		<title>Audio Grid</title>
+		<style>
+html{		width:100%; height:100%;}
+body{		background:black; color:white; font-family:"Verdana"; font-size:12px; height:100%;}
+div{		color:white;}
+select,textarea{background:black; color:white;}
+.tbl{		display:table;}
+.row{		display:table-row;}
+.cell{		display:table-cell;}
+.inline{	display:inline-block;}
+.stdwidth{	display:inline-block; width:200px;}
+.spot{		background:white; color:black; text-align:center; vertical-align:middle; font-size:9px; width:36px; height:36px; border:2px solid black;
+			-webkit-border-radius:33%; -moz-border-radius:33%; border-radius:33%;}
+.bord{		padding:2px; border:2px solid white; -webkit-border-radius:7px; -moz-border-radius:7px; border-radius:7px;}
+		</style>
+		<script language="javascript" src="jquery/jquery-1.8.0.min.js"></script>
+		<script language="javascript" src="jquery/jquery.color.js"></script>
+		<script language="javascript" src="sounds.js"></script>
+		<script language="javascript" src="dsp.js"></script>
+		<script language="javascript" src="pitchshift.js"></script>
+		<script type="text/javascript">
+
+AudioBuffer.prototype.clone = function(){
+	var newBuffer = AUDIO.createBuffer(this.numberOfChannels, this.length, this.sampleRate);
+	for(var i=0; i<this.numberOfChannels; i++){
+		var inChannel  = this.getChannelData(i), outChannel = newBuffer.getChannelData(i);
+		for(var j=0; j < inChannel.length; j++)
+			outChannel[j] = inChannel[j];
+	}
+	return newBuffer;
+} //clone
+//Perform frequency shift on a buffer
+AudioBuffer.prototype.scaleFrequencyViaDFT = function(freqCoeff){
+	if( freqCoeff==1 )	return this;
+	if( freqCoeff> 2 )	return this.scaleFrequencyViaDFT( 2).scaleFrequencyViaDFT(freqCoeff/ 2);
+	if( freqCoeff<.5 )	return this.scaleFrequencyViaDFT(.5).scaleFrequencyViaDFT(freqCoeff/.5);
+	var shifter = new Pitchshift( FFT_SIZE, this.sampleRate, 'FFT' );
+	for(var i=0; i<this.numberOfChannels; i++){
+		var channelData = this.getChannelData(i);
+		shifter.process(freqCoeff, channelData.length, FFT_FRAGMENTS, channelData);
+		for(var j=0; j < channelData.length; j++)
+			channelData[j] = shifter.outdata[j];
+	}
+	return this;
+} //scaleFrequencyViaDFT
+
+Pitchshift.prototype.analyze = function(numSampsToProcess, osamp, indata){
+	function setArray(array, length, val) {
+		var intLength = Math.floor(length);
+		for (var i = 0; i < intLength; i++)
+			array[i] = val;
+	}
+	//PitchShift: factor value which is between 0.5 (one octave down) and 2. (one octave up).
+	var fftFrameSize2 = this.fftFrameSize_ / 2, stepSize = this.fftFrameSize_ / osamp,
+		freqPerBin = this.sampleRate_ / this.fftFrameSize_, expct = 2. * Math.PI * stepSize / this.fftFrameSize_,
+		inFifoLatency = this.fftFrameSize_ - stepSize, j, k = 0, magn, phase, tmp, qpd, index, signal;
+	if (this.gRover_ === false)
+		this.gRover_ = inFifoLatency;
+	//Main processing loop
+	for (j = 0; j < numSampsToProcess; j++) {
+		//As long as we have not yet collected enough data just read in
+		this.gInFIFO[this.gRover_] = indata[j];
+		this.outdata[j] = this.gOutFIFO[this.gRover_ - inFifoLatency];
+		this.gRover_++;
+		//We have enough data for processing
+		if (this.gRover_ >= this.fftFrameSize_) {
+			this.gRover_ = inFifoLatency;
+			//Windowing
+			for (k = 0; k < this.fftFrameSize_; k++)
+				this.gFFTworksp[k] = this.gInFIFO[k] * this.hannWindow_[k];
+			this.fft.forward(this.gFFTworksp);
+			//Analysis
+			for (k = 0; k <= fftFrameSize2; k++) {
+				if (this.algo === "FFT") {
+					magn = 2 * Math.sqrt(this.fft.real[k] * this.fft.real[k] + this.fft.imag[k] * this.fft.imag[k]);
+					phase = Math.atan2(this.fft.imag[k], this.fft.real[k]);
+				} else if (this.algo === "RFFT") {
+					var imaginary, real;
+					real = this.fft.trans[k];
+					imaginary = k==0 ? 0 : this.fft.trans[this.fftFrameSize_ - k];
+					magn = 2 * Math.sqrt(real * real + imaginary * imaginary);
+					phase = Math.atan2(imaginary, real);
+				} else {
+					throw new Error("Invalid DFT algorithm selected " + this.algo);
+				}
+				//Compute and subtract phase difference
+				tmp = phase - this.gLastPhase[k];
+				this.gLastPhase[k] = phase;
+				tmp -= k * expct;
+				//Map delta phase into +/- Pi interval
+				qpd = tmp / Math.PI;
+				if (qpd >= 0) {
+					qpd = Math.floor(qpd);
+					/* This probably won't work like in C */
+					qpd += qpd & 1;
+				} else {
+					qpd = Math.ceil(qpd);
+					qpd -= qpd & 1;
+				}
+				tmp -= Math.PI * qpd;
+				//Get deviation from bin frequency from the +/- Pi interval
+				tmp = osamp * tmp / (2 * Math.PI);
+				//Compute the k-th partials' true frequency
+				tmp = k * freqPerBin + tmp * freqPerBin;
+				//Store magnitude and true frequency in analysis arrays
+				this.gAnaMagn[k] = magn;
+				this.gAnaFreq[k] = tmp;
+			}
+		}
+	} //for numSampsToProcess
+	//this.gAnaFreq stores frequencies
+	//this.gAnaMagn stores magnitudes
+} //analyze
+
+AudioBufferSourceNode.prototype.setStartTime = function(){
+	this.startTime = this.context.currentTime;
+} //setStartTime
+AudioBufferSourceNode.prototype.scaleFrequencyViaPlayback = function(freqCoeff){
+	this.playbackRate.value = freqCoeff;
+} //scaleFrequencyViaPlayback
+AudioBufferSourceNode.prototype.progress = function(){
+	//NOTE: Factoring in playback rate
+	var progress = this.startTime ? (this.context.currentTime - this.startTime)*this.playbackRate.value / this.buffer.duration : 0;
+	if(progress >1)	progress = 1;
+	return progress;
+} //progress
+
+function refreshMetronome(){
+	var cvs = $("#metronome")[0];
+	var ctx = cvs.getContext("2d");
+	var w = cvs.width, h = cvs.height;
+	ctx.imageSmoothingEnabled = true;	ctx.lineWidth = 3;
+	ctx.fillStyle="black";	ctx.fillRect(0,0, w,h);
+	ctx.fillStyle="white";	ctx.ellipse(w/2,h, w,h, 0, 0,Math.PI*2);	ctx.fill();
+	ctx.fillStyle="black";	ctx.beginPath();	ctx.moveTo(w/2,h);	ctx.lineTo(0,0);	ctx.lineTo(0,h);	ctx.closePath();	ctx.fill();
+							ctx.beginPath();	ctx.moveTo(w/2,h);	ctx.lineTo(w,0);	ctx.lineTo(w,h);	ctx.closePath();	ctx.fill();
+	ctx.strokeStyle="black";	ctx.beginPath();	ctx.moveTo(w/2,h);	ctx.lineTo(w/2, 0);	ctx.closePath();	ctx.stroke();
+	ctx.strokeStyle="red";	ctx.beginPath();	ctx.moveTo(w/2,h);	ctx.lineTo(w/2 + METRONOME_AMP*w/2, 0);	ctx.closePath();	ctx.stroke();
+} //refreshMetronome
+
+function toInts(commaSeparatedString){
+	var vals = commaSeparatedString.split(",");
+	for(var i=0; i<vals.length; i++)
+		vals[i] = parseInt( vals[i] );
+	return vals;
+} //toInts
+function toFloats(commaSeparatedString){
+	var vals = commaSeparatedString.split(",");
+	for(var i=0; i<vals.length; i++)
+		vals[i] = parseFloat( vals[i] );
+	return vals;
+} //toFloats
+
+function roundToMultiple(m, n){
+	return n*Math.round(m/n);
+} //roundToMultiple
+function roundArrayToMultiple(array, n){
+	for(var i=0; i<array.length; i++)
+		array[i] = roundToMultiple(array[i], n);
+	return array;
+} //arrayMultiply
+
+function arrayMultiply(array, n){
+	for(var i=0; i<array.length; i++)
+		array[i] *= n;
+	return array;
+} //arrayMultiply
+
+function arrayAdd(array, n){
+	for(var i=0; i<array.length; i++)
+		array[i] += n;
+	return array;
+} //arrayAdd
+
+function arrayClone(array){
+	var array2 = [];
+	for(var i=0; i<array.length; i++)
+		array2[i] = array[i];
+	return array2;
+} //arrayClone
+
+function arrayMod12(array){
+	for(var i=0; i<array.length; i++)
+		array[i] = mod12(array[i]);
+	return array;
+} //arrayMod12
+
+function arrayIndexOf(array, val){
+	for(var i=0; i<array.length; i++)
+		if( array[i] == val )
+			return i;
+	return -1;
+} //arrayIndexOf
+
+function arrayContains(array, val){
+	return arrayIndexOf(array, val) >=0;
+} //arrayContains
+
+function arrayRemove(array, i){
+	array.splice(i, 1);
+} //arrayRemove
+
+function mod12(note){
+	return (note + 1000*12) % 12;
+} //mod12
+
+function log(str){
+	console.log( str );
+	$("#txtDebug").val( $("#txtDebug").val()+str+"\r\n" );
+	//Double the length because Opera is inconsistent
+	//var len = $("#txtDebug").val().length * 2;
+	//txtDebug.setSelectionRange(len, len);
+} //log
+
+//MAIN
+
+function mainWebAudio(){
+try{
+	var iOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+	//TODO: Each note has an active level which is set to 1 when played, linked to a play process, and fades
+	//TODO: For each note source there is a start time AUDIO.currentTime, BUFFER.duration, clear memory when done
+	//TODO: Have a key that mutes the currently selected note
+	//TODO: Maybe suppress default right-click on #grid
+	NOTE_NAMES_24 = ["C","C\u2021","C#","D\u2422","D","D\u2021","D#","E\u2422","E","E\u2021","F","F\u2021",
+					 "F#","G\u2422","G","G\u2021","G#","A\u2422","A","A\u2021","A#","B\u2422","B","B\u2021"];
+	NUM_COLS = 25;//NUM_NOTES*2+1;	//TODO: Customize
+	AUDIO = iOS ? new webkitAudioContext() : new AudioContext();
+	GAIN = AUDIO.createGain();
+	GAIN.connect( AUDIO.destination );
+	ANALYSER = AUDIO.createAnalyser();
+	BUFFERS = [];	//Stores instrument buffers
+	SHIFTED_BUFFERS = [];
+	SHIFTED_BUFFERS_INTERVAL_ST = 6;
+	CLICK_BUFFER = null;	//Stores instrument buffers
+	T_CLICK = 0;
+	SOURCES = [];	//Stores instances of sound sources
+	SOURCE_CUR = null;
+	SOURCE_BEND = null, BEND_PREV_NOTE = 0, BEND_PREV_TIME = 0, BEND_DEST_NOTE = 0, BEND_DEST_TIME = 0;	//Portamento
+	NOTE = 0;
+	SCALE_TOLERANCE_ST = 0.15;
+	FFT_SIZE = 2048;//4096;
+	FFT_FRAGMENTS = 4;//8
+	STROKE_ST = [0];
+	SCALE_ST = selectedScaleNotes();
+	HOVER_NOTE = 0;
+	HOVER_FRET = 0;
+	HOVER_SPOT = "";
+	SKEW = 0;
+ 
+	//Load sounds
+	for(var i=0; i<SOUND_FILES.length; i++){
+		loadSoundToBufferArray( "sounds/"+SOUND_FILES[i], BUFFERS, i );
+		$("<option>").attr("value",i).text(SOUND_FILES[i]).appendTo("#selInstrument");
+	}
+	//$("#selInstrument").val(33)
+	/*
+	CLICK_BUFFER = null;
+	CLICK_FILES = ["", "Tick.wav", "Noise.wav"];
+	for(var i=0; i<CLICK_FILES.length; i++)
+		$("<option>").attr("value",i).text(CLICK_FILES[i]).appendTo("#selClickTrack");
+	loadSound("clicks/"+CLICK_FILES[parseInt($("#selClickTrack").val())], function(buffer){CLICK_BUFFER = buffer;});
+	$("#selClickTrack").change(function(){
+		if( parseInt($(this).val()) )
+			loadSound("clicks/"+CLICK_FILES[parseInt($(this).val())], function(buffer){CLICK_BUFFER = buffer;});
+	});
+	//*/
+
+	refresh();	refreshGrid();	refresh();
+
+	//Inputs
+	$("#chkCircle5th").change(function(){
+		refresh();	refreshGrid();
+	});
+	$("#sldVolume").change(function(){
+		refresh();
+	});
+	$("#selInstrument").change(function(){
+		$(this).blur();	
+	//	SHIFTED_BUFFERS[INSTRUMENT] = [];
+		refresh();	refreshGrid();
+	});
+	$("#sldNumNotes").change(function(){
+		refresh();	refreshGrid();
+	});
+	$("#sldShift").change(function(){
+		refresh();	refreshGrid();	//playDefault();
+	});
+	$("#sldBPM").change(refresh);
+	$("#selScale").change(function(){
+	//	$(this).blur();	
+		SCALE_ST = selectedScaleNotes();
+		$(sldNumNotes).val( $("#selScale option:selected").attr("numnotes") );
+		refresh();	refreshGrid();
+	});
+	$("#selTuning").change(function(){
+		refresh();	refreshGrid();
+	});
+	$("#selSkew").change(function(){
+		SKEW = $("#selSkew").val();
+		refresh();	refreshGrid();
+	});
+
+	setInterval(refresh, 50);	//Refresh loop!	//TODO: Color transitions would make this frequency unnecessary, see if this slows down moble
+
+	//Key control
+	$("body").keypress(keypress).keydown(keydown).keyup(keyup);
+}catch(ex){ log(ex); }
+} //mainWebAudio
+
+function getBufferNoteFloat(buffer){
+	//Simplify calculation by just analyzing largest 2^n sample within first channel
+	var sampleSize = Math.pow(2, Math.floor( Math.log2( buffer.getChannelData(0).length ) ) );	
+	var shifter = new Pitchshift( FFT_SIZE, buffer.sampleRate, 'FFT' );
+	shifter.analyze( buffer.getChannelData(0).length, 1, buffer.getChannelData(0) );	
+	//Find strongest frequency
+	var iMax=0, max = 0; for(i=1; i<shifter.gAnaMagn.length/2; i++){	//Only concern with the 1st half of the DFT, but not 0 Hz
+		if(shifter.gAnaMagn[i] > max){
+			max = shifter.gAnaMagn[i];
+			iMax = i;
+		}
+	}
+	var freq = shifter.gAnaFreq[iMax];
+	if( isNaN(freq) || !isFinite(freq) )	//Failsafe if analysis is a bust
+		return 0;
+	//+-23.4 Hz for sample rate 48000 and DFT size 2048, 24 kHz max
+	//Use adjacent samples to parabolically estimate an approximation for INSTRUMENT_NATIVE_NOTE
+	if( iMax-1>=0 && iMax+1<shifter.gAnaMagn.length ){
+		var f1, f2, f3, y1, y2, y3, a, b, c;
+		f1 = shifter.gAnaFreq[iMax-1], f2 = shifter.gAnaFreq[iMax], f3 = shifter.gAnaFreq[iMax+1];
+		y1 = shifter.gAnaMagn[iMax-1], y2 = shifter.gAnaMagn[iMax], y3 = shifter.gAnaMagn[iMax+1];
+		c = y2, b = (y3-y1)/2, a = y3 - b - y2;
+		var offset = -b/a;
+		freq = f2 + offset*( offset>0 ? f3-f2 : f2-f1 );
+	}
+//	log( "getBufferNoteFloat: "+freq.toFixed(2) +" Hz, "+ mod12(12*Math.log2(freq/440)-3).toFixed(2)+" st" );
+	return NUM_NOTES*Math.log2(freq/440)-3;
+} //getBufferNoteFloat
+
+function refresh(){
+	NUM_NOTES = parseInt( $("#sldNumNotes").val() );
+	$("#txtNumNotes").text( NUM_NOTES );
+	
+	var tempVolume = parseInt( $("#sldVolume").val() );
+	var tempShift = parseInt( $("#sldShift").val() );	//NOTE: Is note st, but 12/NUM_NOTES interval
+	var tempFineTune = parseInt( $("#sldFineTune").val() );
+	$("#txtVolume").text( tempVolume+"%" );
+	$("#txtShift").text( tempShift );
+	$("#txtFineTune").text( tempFineTune+" ct" );
+	GAIN.gain.value = tempVolume*0.01;
+	SHIFT_ST = tempShift*12/NUM_NOTES;
+	FINE_TUNE_ST = tempFineTune/100;
+	
+	ECHO = chkEcho.checked;
+	BPM = parseInt( $("#sldBPM").val() );
+	NPB = parseInt( $("#sldNPB").val() );
+	BPL = parseInt( $("#sldBPL").val() );
+	$("#txtBPM").text( BPM+" (" + (60000/BPM).toFixed(0)+" ms)" );
+	$("#txtNPB").text( NPB );
+	$("#txtBPL").text( BPL+" (" + (60000*BPL/BPM).toFixed(0)+" ms)" );
+	//TODO: Implement a METRONOME_SYNC_TIME feature
+	METRONOME_PHASE = (AUDIO.currentTime / (60/BPM)) % 1;
+	METRONOME_AMP   = Math.sin( Math.PI * ((AUDIO.currentTime / (60/BPM)) % 2) );
+	if( AUDIO.currentTime > T_CLICK){
+		var period = 60/BPM;
+		T_CLICK = Math.ceil(AUDIO.currentTime / period) * period;
+	//	playSound(CLICK_BUFFER, T_CLICK, 1, 0);	//submitNote
+	}
+	
+	INSTRUMENT = toInts( $("#selInstrument").val() );
+	TUNING_ST = roundArrayToMultiple(toFloats( $("#selTuning").val() ), 12/NUM_NOTES);
+	NUM_ROWS = TUNING_ST.length;
+
+	//TODO: Move this away from general refresh
+	//Detect that instrument has been changed, update INSTRUMENT_NATIVE_NOTE and SHIFTED_BUFFERS
+	if( BUFFERS[INSTRUMENT] ){
+		if( !SHIFTED_BUFFERS[INSTRUMENT] || !SHIFTED_BUFFERS[INSTRUMENT].length ){
+	//	if( !SHIFTED_BUFFERS || !SHIFTED_BUFFERS.length ){
+			var tStart = new Date();
+			INSTRUMENT_NATIVE_NOTE = mod12( getBufferNoteFloat( BUFFERS[INSTRUMENT] ) );
+			refreshShiftedBuffers();
+//	log( "refreshShiftedBuffers: "+SHIFTED_BUFFERS[INSTRUMENT].length+" buffers, "+((new Date()-tStart)/1000).toFixed(2)+" s" );
+		}
+	}
+
+	//Remove finished sources
+	for(var s=SOURCES.length-1; s>=0; s--)
+		if(SOURCES[s].progress() >= 1)
+			SOURCES.splice(s, 1);
+	//Set beat color effects
+	var bord = "2px solid rgb("+parseInt(255 - 255*METRONOME_PHASE)+",0,0)";
+	$("#grid").css("border", bord);
+	$("#chordGrid").css("border", bord);
+	//Set spot color effects for active sound sources
+	$("div.spot[note]").css("border", "2px solid black");
+	for(var s=0; s<SOURCES.length; s++){
+		var note = SOURCES[s].note;
+		var l = parseInt(255-255*SOURCES[s].progress());
+		$("div.spot[note='"+note.toFixed(2)+"']").css("border", "2px solid rgb("+l+","+l+","+l+")");
+	}
+	//Update SOURCE_BEND
+	if( SOURCE_BEND ){
+		var ratio = BEND_DEST_TIME == BEND_PREV_TIME ? 1 : (AUDIO.currentTime - BEND_PREV_TIME) / (BEND_DEST_TIME - BEND_PREV_TIME);
+		if(ratio>1) ratio = 1;
+		var newNote = BEND_PREV_NOTE + ratio * (BEND_DEST_NOTE - BEND_PREV_NOTE);
+		var shift = newNote - SOURCE_BEND.octaveIndex*SHIFTED_BUFFERS_INTERVAL_ST;	//Tells how many shifts away from alternate buffer we want to play
+		SOURCE_BEND.playbackRate.value = semitonesToFreqCoeff(shift - INSTRUMENT_NATIVE_NOTE);	//TODO: Transition over beat
+		BEND_PREV_TIME = AUDIO.currentTime;
+		BEND_PREV_NOTE = newNote;
+	}
+//	refreshMetronome();
+} //refresh
+
+function refreshShiftedBuffers(){
+	try{
+		if( !SHIFTED_BUFFERS[INSTRUMENT] ){	//Use pitch shifting to preserve note duration
+			SHIFTED_BUFFERS[INSTRUMENT] = [];
+			//Get min oct, max oct, and mid index
+			var noteMin = 1000, noteMax = -1000;
+			for(var s=0; s<NUM_ROWS; s++){
+				for(var f=0; f<NUM_COLS; f++){
+					var note = TUNING_ST[s] + SHIFT_ST + f*12/NUM_NOTES;
+					if( note<noteMin )	noteMin = note;
+					if( note>noteMax )	noteMax = note;
+				}
+			}
+			SHIFTED_BUFFERS_MIN = parseInt( noteMin/SHIFTED_BUFFERS_INTERVAL_ST );
+			SHIFTED_BUFFERS_MAX = parseInt( noteMax/SHIFTED_BUFFERS_INTERVAL_ST );
+
+			for(var oct=SHIFTED_BUFFERS_MIN; oct<=SHIFTED_BUFFERS_MAX; oct++)
+				SHIFTED_BUFFERS[INSTRUMENT][oct-SHIFTED_BUFFERS_MIN] = 
+					BUFFERS[INSTRUMENT].clone().scaleFrequencyViaDFT( Math.pow(2,oct*SHIFTED_BUFFERS_INTERVAL_ST/12) );
+		} //if
+	}catch(ex){ log( ex ); }
+} //refreshShiftedBuffers
+
+function refreshGrid(){
+	$("#grid").empty().mousedown(function(event){
+		event.preventDefault();
+	});
+	//Populate grid
+	$("<div>").addClass("row").attr("id","trFretNumbers").appendTo("#grid");
+	for(var s=NUM_ROWS-1; s>=0; s--)
+		$("<div>").addClass("row").attr("id","string"+s).appendTo(
+			$("<div>").addClass("tbl").appendTo("#grid")
+		);
+	//Create labels
+	for(var f=0; f<NUM_COLS; f++)
+		$("<div>").addClass("cell spot").attr("id","fret"+f).attr("fret",f).text(f).appendTo("#trFretNumbers").mousedown(function(event){
+			event.preventDefault();
+			var f = parseInt( $(this).attr("fret") );
+			strum( f );
+		}).mouseover(function(){
+			HOVER_FRET = parseInt( $(this).attr("id").split("fret")[1] );
+			HOVER_SPOT = $(this).attr("id");
+		});
+	//Create rows
+	for(var s=0; s<NUM_ROWS; s++){
+		if(SKEW==-1 && s%2==0)	//Offset test
+			$("<div>").addClass("cell spot").css('width','18px').css("background", "black").attr("oncontextmenu", "false").appendTo("#string"+s)
+		if(SKEW==1 && s%2==1)	//Offset test
+			$("<div>").addClass("cell spot").css('width','18px').css("background", "black").attr("oncontextmenu", "false").appendTo("#string"+s)
+		//Create cols
+		for(var f=0; f<NUM_COLS; f++){
+			var tuning = TUNING_ST[s];
+			tuning += -SKEW*Math.floor(s/2);
+			if(SKEW==-1)	tuning += 1-Math.floor(NUM_ROWS/2);
+			var note = tuning + SHIFT_ST + f*12/NUM_NOTES;
+			//Grid interactivity!
+			$("<div>").addClass("cell spot").attr("id","spot"+s+"_"+f).attr("note",note.toFixed(2)).attr("oncontextmenu", "false").text(noteToName(note)).appendTo("#string"+s)
+			.on({"touchmove":function(event){event.preventDefault(); mouseoverNote} })
+			.mouseover(mouseoverNote)
+			.mousedown(function(event){
+				event.preventDefault();
+				var note = parseFloat( $(this).attr("note") );
+				if(event==null || event.which==1){	//Left
+						submitNote( note, INSTRUMENT );
+				}else if(event.which==3){	//Right	//TODO: SHIFT affects this adversely
+						var iNote = arrayIndexOf( SCALE_ST, mod12(note-SHIFT_ST) );
+					//	log( "["+SCALE_ST.join(",") +"]["+iNote+"] = "+note );
+						if( iNote<0 )	SCALE_ST.push( mod12(note-SHIFT_ST) );
+						else	arrayRemove(SCALE_ST, iNote );
+					//	log( "["+SCALE_ST.join(",") +"]" );
+						refreshGrid();
+						refreshChordGrid();
+				}
+			}).mouseup(function(event){
+			}).on({"touchstart": function(event){	//TODO: Get touch mobile-ready (Loads on: Droid Chrome)
+			//	event.preventDefault();
+				log( "touchstart: "+event );
+			} });
+		}
+		if(SKEW==-1 && s%2==1)	//Offset test
+			$("<div>").addClass("cell spot").css('width','18px').css("background", "black").attr("oncontextmenu", "false").appendTo("#string"+s)
+		if(SKEW==1 && s%2==0)	//Offset test
+			$("<div>").addClass("cell spot").css('width','18px').css("background", "black").attr("oncontextmenu", "false").appendTo("#string"+s)
+	}
+	$("div.spot[fret]").css("background", "white");
+	$("div.spot[note]").each(function(){
+		var note = parseFloat($(this).attr("note"));
+		$(this).css("background", noteToCssRgb( note, noteIsInScale(note) ));
+	});
+	
+	refreshChordGrid();
+} //refreshGrid
+
+//TODO: Position spots by absolute instead of by layout
+function refreshChordGrid(){
+	$("#chordGrid").empty().mousedown(function(event){
+		event.preventDefault();
+	});
+	//Populate grid
+	var INTERVAL_NAMES_12 = ["I","I#","II","II#","III","IV","IV#","V","V#","VI","VI#","VII"];
+	//TODO: Account for SHIFT
+	for(var j=0; j<=10; j++){	//Row
+		var tr = $("<div>").addClass("row").appendTo("#chordGrid");	//Majors
+		for(var k=0; k<25; k++){	//Col
+			var i = k;
+			if(chkCircle5th.checked)	i = mod12(k*7)
+			var mOff = 9;	//This variable is in case you want to shift minors to line up to relative majors
+			var strNotes, name = NOTE_NAMES_24[2*mod12(i)];//INTERVAL_NAMES_12[i];
+			var chordMinors   = [1,          1,         1,       0,       0,         0,          0,          0,         0,       0,       0];
+			var chordSuffixes = ["m7",       "m6",      "m",     "",      "6",       "7",        "M7",       "add9",    "sus2",  "sus4",  "+"];
+			var chordNotes    = [[0,3,7,10], [0,3,7,9], [0,3,7], [0,4,7], [0,4,7,9], [0,4,7,10], [0,4,7,11], [0,2,4,7], [0,2,7], [0,5,7], [0,4,8]];
+			//
+			strNotes = arrayMod12( arrayAdd(chordNotes[j], i+mOff*chordMinors[j]) );
+			name = NOTE_NAMES_24[2*mod12(i+mOff*chordMinors[j])].toUpperCase() + chordSuffixes[j];
+			//Assign attributes, actions
+			$("<div>").addClass("cell spot").attr("id","chord"+j+"_"+i).attr("interval",i)
+			.attr("notes",strNotes).text(name).appendTo(tr)
+			.mouseover(function(event){
+				HOVER_SPOT = $(this).attr("id");
+			})
+			.mousedown(function(event){
+				var ii = parseInt( $(this).attr("interval") );
+				var notes = toFloats( $(this).attr("notes") );
+				switch(event.which){
+					case undefined:	case 1:	//Left Click Chord
+						SCALE_ST = arrayAdd( notes, -SHIFT_ST );	//TODO: This causes problem, because SCALE_ST currently neglects SHIFT
+						if( chkPlayChordSelect.checked )
+							strum( HOVER_FRET );
+						//	for(var k=0; k<notes.length; k++)
+						//		submitNote(notes[k], INSTRUMENT);	//TODO: Why is SHIFT_ST now not affecting play?
+						break;
+					/*
+					case 3: //Right Click Chord
+						//TODO
+						if( !notesAreInScale(notes) )	//Add to scale
+							for(var k=0; k<notes.length; k++)
+								if( !noteIsInScale(notes[k], SCALE_ST) )
+									SCALE_ST.push( mod12(notes[k]-SHIFT_ST) );
+						else	//Abolish from scale
+							for(var k=0; k<notes.length; k++)
+								if( noteIsInScale(notes[k], SCALE_ST) )
+									arrayRemove( SCALE_ST, arrayIndexOf( SCALE_ST, mod12(notes[k]-SHIFT_ST) ) );
+						break;
+					//*/
+				}
+				refreshGrid();
+			}); //mousedown
+		} //for
+	} //for
+	//Initialize colors
+	$("div.spot[interval]").each(function(){
+		var ii = parseInt( $(this).attr("interval") );
+		var note = ii;
+		var notes = toFloats( $(this).attr("notes") );	//Chord notes
+		var scale = chkDynamicHighlight.checked ? SCALE_ST : selectedScaleNotes();	//To distinguish highlight scale from selected scale
+	//	var inScale = notesAreInScale(notes, scale);	//TODO: Fix which notes highlight
+		var rgb = chordToCssRgb(notes, scale);
+		if( notesAreInScale(notes, scale) && notesAreInScale(scale, notes) )
+			$(this).css("border", "2px solid white");
+		else if( notesAreInScale(notes, SCALE_ST) )
+			$(this).css("border", "2px solid gray");
+		$(this).css("background", rgb);
+	});
+} //refreshChordGrid
+
+function mouseoverNote(){
+	var note = parseFloat( $(this).attr("note") );
+	HOVER_NOTE = note;
+	HOVER_FRET = parseInt( $(this).attr("id").split("_")[1] );
+	HOVER_SPOT = $(this).attr("id");
+//	var s = parseInt( $(this).attr("id").charAt(4) );
+	if( noteIsInScale(note) )	//Note is in scale
+		submitNote( note, INSTRUMENT );
+} //mouseoverNote
+
+function selectedScaleNotes(){
+	return toFloats( $("#selScale option:selected").val() );
+} //selectedScaleNotes
+
+function semitonesToFreqCoeff(shift){
+	return Math.pow(2, shift/12);
+} //semitonesToFreqCoeff
+function freqCoeffToSemitones(freqCoeff){
+	return 12*Math.log2(freqCoeff);
+} //freqCoeffToSemitones
+
+function noteToCssRgb1(note, inScale){
+	var phase = -2*Math.PI * note/12;
+	var r = (Math.cos(phase+Math.PI*(0/3+1/6))+1)/2;
+	var g = (Math.cos(phase+Math.PI*(2/3+1/6))+1)/2;
+	var b = (Math.cos(phase+Math.PI*(4/3+1/6))+1)/2;
+	r = inScale ? (1+r)/2 : r/2;
+	g = inScale ? (1+g)/2 : g/2;
+	b = inScale ? (1+b)/2 : b/2;
+	r = parseInt(r*255),	g = parseInt(g*255),	b = parseInt(b*255);
+	return "rgb("+r+", "+g+", "+b+")";
+} //noteToCssRgb1
+function noteToCssRgb2(note, inScale){
+	return $.Color({ hue: 360*mod12(-note)/12 , saturation:inScale?1:1, lightness: inScale?0.5:0.2 }).toString();
+} //noteToCssRgb2
+noteToCssRgb = noteToCssRgb1;
+
+function chordToCssRgb1(notes, scale){
+	var nInScale = 0, nScale = notes.length + scale.length;
+	if(nScale==0)	nScale = 1;
+	for(var n=0; n<scale.length; n++)
+		if(noteIsInScale(notes[n], scale))
+			nInScale++;
+	for(var n=0; n<notes.length; n++)
+		if(noteIsInScale(scale[n], notes))
+			nInScale++;
+	var phase = -2*Math.PI * notes[0]/12;
+	var r = (Math.cos(phase+Math.PI*(0/3+1/6))+1)/2;
+	var g = (Math.cos(phase+Math.PI*(2/3+1/6))+1)/2;
+	var b = (Math.cos(phase+Math.PI*(4/3+1/6))+1)/2;
+	r = r/2 + nInScale/(2.0*nScale);
+	g = g/2 + nInScale/(2.0*nScale);
+	b = b/2 + nInScale/(2.0*nScale);
+	r = parseInt(r*255),	g = parseInt(g*255),	b = parseInt(b*255);
+	return "rgb("+r+", "+g+", "+b+")";
+} //chordToCssRgb1
+chordToCssRgb = chordToCssRgb1;
+
+function noteToName(note){
+	var index = NOTE_NAMES_24.length * mod12(note)/12;
+	if( index.toFixed(2) != Math.round(index.toFixed(2)) )
+		return "";
+	return NOTE_NAMES_24[ index ];
+}//noteToName
+
+function nameToNote(name){
+	for(var note=0; note<NOTE_NAMES_24.length; note++)
+		if( NOTE_NAMES_24[note]==name.toUpperCase() )
+			return note;
+	return -1;
+}//nameToNote
+
+function noteIsInScale(note, scale){
+	if(!scale)	scale = SCALE_ST;
+	var st = mod12(note - SHIFT_ST);
+	for(var i=0; i<scale.length; i++)
+		if( Math.abs(st - mod12(scale[i])) < SCALE_TOLERANCE_ST 
+		 || Math.abs(st - 12 - mod12(scale[i])) < SCALE_TOLERANCE_ST )
+			return true;
+	return false;
+} //noteIsInScale
+
+function notesAreInScale(notes, scale){
+	if(!scale)	scale = SCALE_ST;
+	var inScale = true;
+	for(var n=0; n<notes.length; n++)
+		if( !noteIsInScale(notes[n], scale) )
+			inScale = false;
+	return inScale;
+} //notesAreInScale
+
+//Async load, pass buffer to callback
+function loadSound(url, callback){
+	var request = new XMLHttpRequest();
+	request.open("GET", url, true);
+	request.responseType = "arraybuffer";
+	request.onload = function(){
+		try{
+			AUDIO.decodeAudioData( request.response, function(buffer){ if(callback) callback(buffer); } );
+		}catch(ex){}
+	}
+	request.send();
+} //loadSound
+//Async loads to buffer array, no callback
+function loadSoundToBufferArray(url, buffers, index){
+	loadSound(url, function(buffer){
+		buffers[index] = buffer;
+	});
+} //loadSoundToBufferArray
+function playSound(buffer, time, freqCoeff, note){
+	try{
+		time = time ? time : 0;
+		note = note ? note : 0;
+		var source = AUDIO.createBufferSource();	//Sound source
+		source.buffer = buffer;
+	//	source.connect( AUDIO.destination );	//Destination = Speakers
+	//	source.connect( GAIN );	//SOURCE - GAIN - DESTINATION (Speakers)
+		
+		if(ECHO){
+			var delay = AUDIO.createDelay();
+			delay.delayTime.value = 60/BPM;
+			var feedback = AUDIO.createGain();
+			feedback.gain.value = 0.5;
+			delay.connect(feedback);
+			feedback.connect(delay);
+			source.connect(delay);
+			delay.connect(GAIN);
+		}
+		source.connect(GAIN);
+		
+		source.scaleFrequencyViaPlayback( freqCoeff );
+		source.note = note;
+		source.octaveIndex = parseInt(note/SHIFTED_BUFFERS_INTERVAL_ST);
+		source.setStartTime();	//Extend to hold startTime
+		source.start( time );	//Schedules when time==AUDIO.currentTime seconds
+		SOURCES.push( source );
+		return source;
+	}catch(ex){
+		log(ex);
+		return null;
+	}
+} //playSound
+
+function strum( fret ){
+	if( !fret )	fret = 0;
+	var strumType = $("#selStrum").val();
+	for(var s=0; s<NUM_ROWS; s++){
+		//Search for scale note on string starting from fret
+		var f2=fret, foundScaleNote = false;
+		for(f2=fret; f2<NUM_COLS && !foundScaleNote; f2++){
+			var note = parseFloat( $("#spot"+s+"_"+f2).attr("note") );
+			if( noteIsInScale(note) ){
+				foundScaleNote = true;	break;
+			}
+		}
+		if( f2<NUM_COLS ){
+			var note = TUNING_ST[s] + SHIFT_ST + f2*12/NUM_NOTES;
+			var delay = 0;
+			if( strumType=="1" )	delay = s;
+			if( strumType=="-1" )	delay = (NUM_ROWS-1-s);
+			if( strumType=="2" )	delay = s + 1 - 2*(s%2);
+			if( strumType=="-2" )	delay = (NUM_ROWS-1-s) + 1 - 2*((NUM_ROWS-1-s)%2);
+			//TODO: Rearrange code so I don't have to skip notes
+			if( strumType=="3" )	delay = (s%2 ? s/2 : NUM_ROWS-1/2-s/2);
+			if( strumType=="-3" )	delay = NUM_ROWS-1-(s%2 ? s/2 : NUM_ROWS-1/2-s/2)
+			submitNote(note, INSTRUMENT, delay);
+		}
+	} //Strum
+} //strum
+
+//This function factors program variables into how notes, buffers, sources, and timings are handled
+function submitNote(note, instrument, tickDelay){
+	if( !tickDelay )
+		tickDelay = 0;
+	if( !instrument && INSTRUMENT!=0 )	
+		instrument = INSTRUMENT;
+	//In playbackRate we account for INSTRUMENT_NATIVE_NOTE
+	if( SOURCE_BEND ){	//Instead of creating new source, update current source
+		//Factoring in which shifted buffer
+		var oct = SOURCE_BEND.octIndex;	//Tells how many octaves away from main buffer the alternate buffer is
+		if(!chkUseFFT.checked)	oct = 0;
+		var period = 60/(BPM*NPB), tNext = Math.ceil(AUDIO.currentTime / period)*period + tickDelay*period;//0
+		var curNote = SOURCE_BEND.octIndex*SHIFTED_BUFFERS_INTERVAL_ST + freqCoeffToSemitones(SOURCE_BEND.playbackRate.value);
+		BEND_PREV_TIME = AUDIO.currentTime;
+		BEND_DEST_TIME = tNext + period;
+		BEND_DEST_NOTE = note;
+	//	log( "submitNote: "+note+" st, oct="+oct+" curNote="+curNote );	//TODO: Why is this undefined?
+	}else{	//Create new source
+		BEND_PREV_NOTE = note;
+		BEND_DEST_NOTE = note;
+		var period = 60/(BPM*NPB), tNext = Math.ceil(AUDIO.currentTime / period)*period + tickDelay*period;//0
+		for(var k=0; k<STROKE_ST.length; k++){
+			var note2 = note + STROKE_ST[k];
+			var oct = parseInt(note2 / SHIFTED_BUFFERS_INTERVAL_ST);	//Tells how many octaves away from main buffer the alternate buffer is
+			if(oct<SHIFTED_BUFFERS_MIN)	oct = SHIFTED_BUFFERS_MIN;
+			if(oct>SHIFTED_BUFFERS_MAX)	oct = SHIFTED_BUFFERS_MAX;
+			if(!chkUseFFT.checked)	oct = 0;
+			var shift = note2 - oct*SHIFTED_BUFFERS_INTERVAL_ST + FINE_TUNE_ST;		//Tells how many shifts away from alternate buffer we want to play
+			SOURCE_CUR = playSound( SHIFTED_BUFFERS[instrument][oct-SHIFTED_BUFFERS_MIN], tNext, semitonesToFreqCoeff(shift - INSTRUMENT_NATIVE_NOTE), note2 );
+//log( "submitNote: "+note2+" st, oct="+oct+" shift="+shift+" st" );
+		}
+	}
+} //submitNote
+
+//instrumentID,time;repeat...
+/*
+function playScript(script){
+	var now = AUDIO.currentTime;
+	var events = script.split(";");
+	for(var e=0; e<events.length; e++){
+		var vals = events[e].split(",");
+		if(vals.length>=2){
+			var inst = parseInt(vals[0]);
+			var time = parseInt(vals[1]);
+			var shift = vals.length>=3 ? parseFloat(vals[2]) : 0;
+			playSound( BUFFERS[inst], now+BPM*time, shift );
+		}
+	}
+} //playScript
+//*/
+
+function keydown( event ){
+	var cc = event.which, c = String.fromCharCode(cc).toLowerCase();
+//log( "keydown: "+cc+" "+c );
+	switch(c){
+	}
+	switch(cc){	//Num pad
+		case 66:	if(cc==66)SOURCE_BEND = SOURCE_CUR;	break;	//b
+		case 77:	STROKE_ST = [0,4,7];	break;	//m
+		case 78:	STROKE_ST = [0,3,7];	break;	//n
+		case 75:	STROKE_ST = [0,7];		break;	//k
+		//TODO: Indicate hover fret
+		//TODO: Account for SHIFT_ST
+		case  96:	SCALE_ST = selectedScaleNotes();	refreshGrid();	break;	//I
+		case  97:	SCALE_ST = [0,4,7];		refreshGrid();	if( chkPlayChordSelect.checked )	strum( HOVER_FRET );	break;	//I
+		//TODO: '2' doesn't strum, confuses 'b', so goes into bend mode
+		case  98:	SCALE_ST = [2,5,9];		refreshGrid();	if( chkPlayChordSelect.checked )	strum( HOVER_FRET );	break;	//ii	
+		case  99:	SCALE_ST = [4,7,11];	refreshGrid();	if( chkPlayChordSelect.checked )	strum( HOVER_FRET );	break;	//iii
+		case 100:	SCALE_ST = [5,9,0];		refreshGrid();	if( chkPlayChordSelect.checked )	strum( HOVER_FRET );	break;	//IV
+		case 101:	SCALE_ST = [7,11,2];	refreshGrid();	if( chkPlayChordSelect.checked )	strum( HOVER_FRET );	break;	//V
+		case 102:	SCALE_ST = [9,0,4];		refreshGrid();	if( chkPlayChordSelect.checked )	strum( HOVER_FRET );	break;	//vi
+		case 103:	SCALE_ST = [10,2,5];	refreshGrid();	if( chkPlayChordSelect.checked )	strum( HOVER_FRET );	break;	//VIIb
+		case 104:	SCALE_ST = [11,3,6];	refreshGrid();	if( chkPlayChordSelect.checked )	strum( HOVER_FRET );	break;	//VIIdim+
+		case 107:	SCALE_ST = [0,4,8];		refreshGrid();	if( chkPlayChordSelect.checked )	strum( HOVER_FRET );	break;	//I+
+	}
+} //keydown
+//TODO: Make keydown events that don't repeat while held
+function keyup(event){
+	var cc = event.which, c = String.fromCharCode(cc).toLowerCase();
+//log( "keyup: "+cc+" "+c );
+	switch(c){
+		case "b":	SOURCE_BEND = null;	BEND_PREV_TIME = 0;	BEND_DEST_TIME = 0;		break;
+		case "m":case "n":case "k":	STROKE_ST = [0];	break;
+		case "o":	strum( HOVER_FRET );	break;
+		case "p":	submitNote( HOVER_NOTE, INSTRUMENT );	break;
+		case "z":	$("#"+HOVER_SPOT).trigger("mousedown");	break;
+	}
+} //keyup
+function keypress(event){
+	var cc = event.charCode, c = String.fromCharCode(cc).toLowerCase();
+//log( "keypress: "+cc+" "+c );
+	try{
+		var buffer = BUFFERS[INSTRUMENT];
+		switch(c){
+			case "a":	break;	//playScript("0,0;0,1;1,2;0,5;0,7;0,9;1,10;1,11;2,12;2,14");
+		}
+	}catch(ex){
+	//	log(ex.message);
+	}
+} //keypress
+
+$(document).ready(mainWebAudio); //ready
+		</script>
+	</head>
+	<body oncontextmenu="return false;">
+		
+		<!--canvas id='metronome' style='width:100px; height:100px' ></canvas> <br/-->
+		
+		<div class='tbl' >
+			<div class='row' >
+				<div class='cell' style='padding:4px' >
+
+					<b>Experiment with WebAudio - David Linderman (2016)</b> <br/>
+					<div id='grid' class='bord' ></div> <br/>
+					<div id='chordGrid' class='tbl bord' ></div> <br/>
+				</div>
+				<div class='cell' style='padding:4px' >
+
+					<b>Sound</b> <br/>
+					<div class="bord">
+						<div class='stdwidth'>Volume:</div>
+							<input id='sldVolume' type='range' class='stdwidth' min='0' max='100' value='50' /> <div id='txtVolume' class='inline'></div> <br/>
+						<div class='stdwidth'>Instrument:</div>
+							<select id='selInstrument' class='stdwidth' ></select> <br/>
+						<input type="checkbox" id="chkEcho">Use Echo <br/>
+						<input type="checkbox" id="chkUseFFT" checked>Use FFT Pitch Shifting <br/>
+					</div>
+					<br/> 
+
+					<b>Chords</b> <br/>
+					<div class="bord">
+						<input type="checkbox" id="chkPlayChordSelect" checked>Play Chord On Select <br/>
+						<input type="checkbox" id="chkCircle5th" checked>Circle of Fifths <br/>
+						<input type="checkbox" id="chkDynamicHighlight" >Dynamic Highlight <br/>
+					</div>
+					<br/> 
+
+					<b>Notes</b> <br/>
+					<div class="bord">
+						<div class='stdwidth'>Scale:</div>	<!--NOTE: Modulo [0,12)-->
+							<select id='selScale' class='stdwidth' >
+								<option numnotes='12' value=''>None</option>
+								<option numnotes='12' value='0,.1,.2,.3,.4,.5,.6,.7,.8,.9, 1,1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,
+									2,2.1,2.2,2.3,2.4,2.5,2.6,2.7,2.8,2.9, 3.0,3.1,3.2,3.3,3.4,3.5,3.6,3.7,3.8,3.9,
+									4,4.1,4.2,4.3,4.4,4.5,4.6,4.7,4.8,4.9, 5.0,5.1,5.2,5.3,5.4,5.5,5.6,5.7,5.8,5.9,
+									6,6.1,6.2,6.3,6.4,6.5,6.6,6.7,6.8,6.9, 7,7.1,7.2,7.3,7.4,7.5,7.6,7.7,7.8,7.9,
+									8,8.1,8.2,8.3,8.4,8.5,8.6,8.7,8.8,8.9, 9,9.1,9.2,9.3,9.4,9.5,9.6,9.7,9.8,9.9,
+									10,10.1,10.2,10.3,10.4,10.5,10.6,10.7,10.8,10.9, 11,11.1,11.2,11.3,11.4,11.5,11.6,11.7,11.8,11.9'>All</option>
+								<!--Em  Am Dm G C F  Bb   Bdim  -->
+								<!--iii vi ii V I IV VIIb VIIo-->
+								<!--Ionian, Dorian, Phrygian, Lydian, Mixolydian, Aeolian, Locrian
+								Ionian		0,2,4,5,7,9,11		0,2,4,5,7,9,11
+								Dorian		2,4,5,7,9,11,12		0,2,3,5,7,9,10
+								Phrygian	4,5,7,9,11,12,14	0,1,3,5,7,8,10
+								Lydian		5,7,9,11,12,14,16	0,2,4,6,7,9,11
+								Mixolydian	7,9,11,12,14,16,17	0,2,4,5,7,9,10
+								Aeolian		9,11,0,2,4,5,7		0,2,3,5,7,8,10
+								Locrian		11,0,2,4,5,7,9		0,1,3,5,6,8,10
+								I  I#/IIb II II#/IIIb III IV IV#/Vb V V#/VIb VI VI#/VIIb VII
+								C  C#/Db  D  D#/Eb    E   F  F#/Gb  G G#/Ab  A  A#/Bb    B  
+								1  #1/b2  2  #2/b3    3   4  #4/b5  5 #5/b6  6  #6/b7    7  
+								0  1      2  3        4   5  6      7 8      9  10       11 -->
+								<option numnotes='12' value='0,1,2,3,4,5,6,7,8,9,10,11'>Chromatic Scale</option>
+								<option numnotes='12' value='0,2,4,7,9' selected='selected' >Major Pentatonic Scale</option>
+								<option numnotes='12' value='0,3,5,7,10'>Minor Pentatonic Scale</option>
+								<option numnotes='12' value='0,2,4,5,7,9,11'>Diatonic Major Scale</option>	<!--Ionian-->
+								<!--option numnotes='12' value='0,2,3,5,7,9,10'>Dorian Mode</option>
+								<option numnotes='12' value='0,1,3,5,7,8,10'>Phrygian Mode</option>
+								<option numnotes='12' value='0,2,4,6,7,9,11'>Lydian Mode</option>
+								<option numnotes='12' value='0,2,4,6,7,9,10'>Mixolydian Mode</option-->
+								<option numnotes='12' value='0,2,3,5,7,8,10'>Natural Minor Scale</option>	<!--Aeolian Mode-->
+								<!--option numnotes='12' value='0,1,3,5,6,8,10'>Locrian Mode</option-->
+								<option numnotes='12' value='0,2,4,5,7,8,11'>Harmonic Major Scale</option>	<!---->
+								<option numnotes='12' value='0,2,3,5,7,8,11'>Harmonic Minor Scale</option>	<!---->
+								<option numnotes='12' value='0,2,4,6,8,10'>Whole Tone Scale</option>
+								<option numnotes='12' value='0,1,3,4,6,8,10'>Altered Dominant Scale</option>
+								<option numnotes='12' value='0,3,4,7,8,11'>Augmented Scale</option>
+								<option numnotes='12' value='0,1,4,6,7,10'>Tritone Scale</option>
+								<option numnotes='12' value='0,1,4,5,6,8,11'>Persian Scale</option>
+								<option numnotes='12' value='0,1,4,5,7,8,11'>Double Harmonic Major Scale</option>	<!--Arabic Maqam Hijaz Kar,Gypsy major,Byzantine-->
+								<option numnotes='12' value='0,2,3,6,7,8,11'>Double Harmonic Minor Scale</option>	<!--Hungarian Minor-->
+								<option numnotes='12' value='0,2,3,6,7,8,10'>Gypsy Scale</option>
+								<option numnotes='12' value='0,2,4,6,7,9,10'>Acoustic Scale</option>	<!--Lydian Dominant-->
+								<option numnotes='12' value='0,1,4,5,7,8,10'>Phrygian Dominant Scale</option>	<!--Spanish Gypsy-->
+								<option numnotes='12' value='0,2,4,5,6,8,10'>Major Locrian Scale</option>
+								<option numnotes='12' value='0,1,3,5,7,9,11'>Neapolitan Major Scale</option>
+								<option numnotes='12' value='0,1,3,5,7,8,11'>Neapolitan Minor Scale</option>
+								<option numnotes='12' value='0,3,5,6,7,10'>Blues Heptatonic Scale</option>
+								<option numnotes='12' value='0,2,3,5,6,8,10'>Half Diminished Scale</option>	<!--Locrian Natural 2-->
+								<option numnotes='12' value='0,1,4,7,8'>In Scale</option>
+								<option numnotes='12' value='0,1,4,7,10'>Insen Scale</option>
+								<option numnotes='12' value='0,1,5,6,10'>Iwato Scale</option>
+								<option numnotes='12' value='0,2,3,7,8'>Hirajoshi Scale</option>
+								<option numnotes='12' value='0,3,5,7,11'>Yo Scale</option>
+								<option numnotes='24' value='0,1.5,3,4,7,8,10'>Maqam Saba</option>
+								<option numnotes='24' value='0,1,3,4,7,8,10'>Maqam Saba Zamzam</option>
+								<option numnotes='24' value='0,1,4,5,7,8,11'>Maqam Hijaz Kar</option>
+								<option numnotes='24' value='0,1,4,5,7,8,10'>Maqam Hijaz Nahawand</option>
+								<option numnotes='24' value='0,1,4,5,7,8.5,10'>Maqam Hijaz Rast</option>
+								<option numnotes='24' value='0,1,4,5,7,9,10'>Maqam Hijaz Zanjaran</option>
+								<option numnotes='24' value='0,1,3,5,7,8,10'>Maqam Kurd</option>
+								<option numnotes='24' value='0,1.5,3,5,7,8,10'>Maqam Bayati</option>
+								<option numnotes='24' value='0,1.5,3,5,7,8.5,10'>Maqam Bayati Husseini</option>
+								<option numnotes='24' value='0,1.5,3,5,6,9,10'>Maqam Bayati Shuri</option>
+								<option numnotes='24' value='0,1.5,3.5,5.5,6.5,8.5,10.5'>Maqam Sikah</option>
+								<option numnotes='24' value='0,1.5,3.5,4.5,7.5,8.5,10.5'>Maqam Sikah Huzam</option>
+								<option numnotes='24' value='0,1.5,3.5,5,7,8.5,10.5'>Maqam Sikah Baladi</option>
+								<option numnotes='24' value='0,1.5,3.5,5,6.5,7.5,10.5'>Maqam Sikah Bastanikar</option>
+								<option numnotes='24' value='0,1.5,3.5,5,6.5,8.5,10.5'>Maqam Sikah Iraq</option>
+								<option numnotes='24' value='0,2.5,3.5,5.5,6.5,8.5,10.5'>Maqam Sikah Mustaar</option>
+								<option numnotes='24' value='0,2,3,6,7,8,11'>Maqam Nawa Athar</option>
+								<option numnotes='24' value='0,2,3,5,7,8,11'>Maqam Nahawand</option>
+								<option numnotes='24' value='0,2,3,5,7,8,10'>Maqam Nahawand Farahfaza</option>
+								<option numnotes='24' value='0,2,3,6,7,9,10'>Maqam Nahawand Nikriz</option>
+								<option numnotes='24' value='0,2,3,5,6,9,10'>Maqam Nahawand Murassah</option>
+								<option numnotes='24' value='0,2,3,5,7,8.5,10'>Maqam Nahawand Ushaq Masri</option>
+								<option numnotes='24' value='0,2,3.5,5,7,9,10.5'>Maqam Rast</option>
+								<option numnotes='24' value='0,2,3.5,5,7,8,11'>Maqam Rast Suznak</option>
+								<option numnotes='24' value='0,2,3.5,5,7,8.5,10'>Maqam Rast Nairuz</option>
+								<option numnotes='24' value='0,2,3.5,5,7,9,10'>Maqam Rast Nahawand</option>
+								<option numnotes='24' value='0,2,3.5,5,7,9,11'>Maqam Rast Mahur</option>
+								<option numnotes='24' value='0,2,4,5,7,8,11'>Maqam Ajam</option>
+								<option numnotes='24' value='0,2,4,5,7,9,10.5'>Maqam Ajam Jiharkah</option>
+							</select> <br/>
+						<div class='stdwidth'>Equal Temperament:</div>
+							<input id='sldNumNotes' type='range' class='stdwidth' min='3' max='24' value='12' /> <div id='txtNumNotes' class='inline'></div> <br/>
+						<div class='stdwidth'>Key Shift:</div>
+							<input id='sldShift' type='range' class='stdwidth' min='-24' max='24' value='0' /> <div id='txtShift' class='inline'></div> <br/>
+						<div class='stdwidth'>Fine Tune:</div>
+							<input id='sldFineTune' type='range' class='stdwidth' min='-50' max='50' value='0' /> <div id='txtFineTune' class='inline'></div> <br/>
+						<div class='stdwidth'>Tuning:</div>	<!--TODO: Add more tunings-->
+							<select id='selTuning' class='stdwidth' >
+								<option value='-20,-15,-10,-5,-1,4'>Guitar EADGBE Standard</option>
+								<option value='-22,-15,-10,-5,-3,2'>Guitar DADGAD</option>
+								<option value='-24,-15,-12,-5,0,4' >Guitar CACGCE Open C6</option>
+								<option value='-20,-15,-10,-5,0,5' >Guitar EADGCF 4ths</option>
+								<option value='-24,-17,-10,-3,4,11'>Guitar CGDAEB 5ths</option>
+								<option value='-17,-10,-3,4'>Mandolin Standard</option>
+								<option value='-24,-18,-12,-6,0,6,12,18'>8 Row Tritone</option>
+								<option value='-24,-17,-12,-5,0,7,12,19'>8 Row Fifths-Fourths</option>
+								<option value='-12,-10,-8,-7,-5,-3,-1,0'>8 Row Diatonic</option>
+							</select> <br/>
+						<div class='stdwidth'>Skew:</div>
+							<select id='selSkew' class='stdwidth' >
+								<option value='-1'>Left</option>
+								<option value='0' selected>None</option>
+								<option value='1'>Right</option>
+							</select>
+					</div>
+					<br /> 
+
+					<b>Rhythm</b> <br/>
+					<div class="bord">
+						<div class='stdwidth'>Beats Per Minute:</div> 
+							<input id='sldBPM' type='range' class='stdwidth' min='15' max='240' value='120' /> <div id='txtBPM' class='inline'></div> <br/>
+						<div class='stdwidth'>Notes Per Beat:</div> 
+							<input id='sldNPB' type='range' class='stdwidth' min='1' max='16' value='4' /> <div id='txtNPB' class='inline'></div> <br/>
+						<div class='stdwidth'>Beats Per Loop:</div>	<!--TODO: Implement loop-->
+							<input id='sldBPL' type='range' class='stdwidth' min='4' max='64' value='8' /> <div id='txtBPL' class='inline'></div> <br/>
+						<div class='stdwidth'>Click Track:</div> 
+							<select id='selClickTrack' class='stdwidth' ></select> <br/>
+						<div class='stdwidth'>Strumming:</div>
+							<select id='selStrum' class='stdwidth' >
+								<option value='0'>Instantaneous</option>
+								<option value='1'>Down (Up)</option>
+								<option value='-1'>Up (Down)</option>
+								<option value='2'>Alternating Down (Up)</option>
+								<option value='-2'>Alternating Up (Down)</option>
+								<option value='3'>Down-Up (Up-Down)</option>
+								<option value='-3'>Up-Down (Down-Up)</option>
+							</select> <br/>
+					</div>
+					<br /> 
+
+					<b>Keys</b> <br/>
+					<div class="bord">
+						b: Bend Note <br/>
+						m: Major Chord of Note <br/>
+						n: Minor Chord of Note <br/>
+						k: Power Chord of Note <br/>
+						p: Play Hovered Note <br/>
+						o: Strum Hovered Column <br/>
+						z: Play Hovered Chord <br/>
+						Num 0: Selected Scale <br/>
+						Num 1: I <br/>
+						Num 2: ii <br/>
+						Num 3: iii <br/>
+						Num 4: IV <br/>
+						Num 5: V <br/>
+						Num 6: vi <br/>
+						Num 7: VIIb <br/>
+						Num 8: VIIdim <br/>
+					</div>
+
+				</div>
+			</div>
+		</div>
+
+		<br /> <b>Debug</b> <br/>
+		<textarea id='txtDebug' style='width:500px; height:200px' ></textarea> <br/>
+	</body>
+</html>
