@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+
+<html lang="en">
+	<head>
+		<title>4D Stereo Viewer</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0, shrink-to-fit=no">
+		<meta name="mobile-web-app-capable" content="yes">
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+		<style>
+			body{width:100%; height:100%; background-color:#000; color:#FFF; margin:0px; padding:0; overflow:hidden;}
+		</style>
+	</head>
+
+	<body onload="init()">
+	</body>
+
+<script>
+function initWebVrConfig(){
+	WebVRConfig = {
+	  //webvr-polyfill configuration
+	  //Forces availability of VR mode.
+	  FORCE_ENABLE_VR: true, //Default: false.
+	  //Complementary filter coefficient. 0 for accelerometer, 1 for gyro.
+	  //K_FILTER: 0.98, //Default: 0.98.
+	  //How far into the future to predict during fast motion.
+	  //PREDICTION_TIME_S: 0.040, //Default: 0.040 (in seconds).
+	  //Flag to disable touch panner. In case you have your own touch controls
+	  //TOUCH_PANNER_DISABLED: true, //Default: false.
+	  //Enable yaw panning only, disabling roll and pitch. This can be useful for panoramas with nothing interesting above or below.
+	  //YAW_ONLY: true, //Default: false.
+	  //Enable the deprecated version of the API (navigator.getVRDevices).
+	  //ENABLE_DEPRECATED_API: true, //Default: false.
+	  //Scales the recommended buffer size reported by WebVR, which can improve performance. Making this very small can lower the effective resolution of your scene.
+	  BUFFER_SCALE: 0.5, //default: 1.0
+	  //Allow VRDisplay.submitFrame to change gl bindings, which is more efficient if the application code will re-bind it's resources on the next frame anyway.
+	  //Dirty bindings include: gl.FRAMEBUFFER_BINDING, gl.CURRENT_PROGRAM, gl.ARRAY_BUFFER_BINDING, gl.ELEMENT_ARRAY_BUFFER_BINDING, and gl.TEXTURE_BINDING_2D for texture unit 0
+	  //Warning: enabling this might lead to rendering issues.
+	  //DIRTY_SUBMIT_FRAME_BINDINGS: true //default: false
+	};
+} //initWebVrConfig
+initWebVrConfig();
+</script>
+<script src="js/es6-promise.js"></script>
+<script src="js/three.js"></script>
+<script src="js/VRControls.js"></script>
+<script src="js/VREffect.js"></script>
+<script src="js/webvr-polyfill.js"></script>
+<script src="js/webvr-manager.js"></script>
+<script src="js/vreticle.js"></script>
+<script src="js/polytope.js"></script>
+<script src="js/jquery-1.8.0.min.js"></script>
+<script>
+
+function rand(){ return Math.random(); } //rand
+
+function cycleShape(){
+	SHAPE_INDEX = (SHAPE_INDEX+1)%SHAPE_SCHLAFLIS.length;	initPoly( SHAPE_SCHLAFLIS[SHAPE_INDEX] );
+} //cycleShape
+
+function cellColor(c, cellCenters){
+	var center = cellCenters[c].clone().setW(0).normalize();
+	return new THREE.Color( (center.x+1)/2, (center.y+1)/2, (center.z+1)/2 );
+} //cellColor
+
+function bindReticlePoly( poly, reticle ){
+	var color = new THREE.Color( 1, 1, 0 );
+	highlight = new THREE.MeshLambertMaterial( {emissive:color, color:color, side:THREE.DoubleSide, transparent:true, opacity:.9, depthTest:false, alphaMap:POLY_TEX_ALPHA} );
+	for( var c=0; c<poly.numCells; c++){
+		var cell = poly.cellMeshes[c];
+		cell.index = c;
+		reticle.add_collider( cell );
+		cell.ongazelong = function(){ this.material = highlight; }
+		cell.ongazeover = function(){ this.material = highlight; }
+		cell.ongazeout  = function(){ this.material = poly.cellFaceMats[this.index]; }
+	}
+} //bindReticlePoly
+
+function onResize( event ){
+	EFFECT.setSize( window.innerWidth, window.innerHeight );
+	CAMERA.aspect = window.innerWidth / window.innerHeight;
+	CAMERA.updateProjectionMatrix();
+} //onResize
+
+function keydown( event ){
+	var cc = event.which, c = String.fromCharCode(cc).toLowerCase();
+//	console.log( "keydown: "+cc+" "+c );
+	KEYS_DOWN[cc] = true;
+} //keydown
+
+function keyup( event ){
+	var cc = event.which, c = String.fromCharCode(cc).toLowerCase();
+//	console.log( "keyup: "+cc+" "+c );
+	KEYS_DOWN[cc] = false;
+	//Do not repeat when held
+	if( cc==32 ){		cycleShape()	}	//SPACE
+	else if( cc==49 ){	POLY.group.visible = !POLY.group.visible;	}	//1
+	else if( cc==50 ){	POLY.group2.visible = !POLY.group2.visible;	}	//2
+	else if( cc==51 )	SPACE_ROTATE = !SPACE_ROTATE;	//3
+} //keyup
+
+function touch(event){
+	cycleShape();
+} //touch
+
+function deviceOrient(event){
+	EVT_ORIENT = event;
+	//updateMotionText();
+} //deviceOrient
+
+function animatePoly( dt_s ){
+	var shadowDrop = -1.5;
+	//Generate matrix
+	var spin = dt_s*.1;
+	var mSpin = new THREE.Matrix4();
+	if( POLY.dimension>=3 ){
+		mSpin.multiply( new THREE.Matrix4().makeRotationXW(spin) );
+		mSpin.multiply( new THREE.Matrix4().makeRotationYW(spin) );
+		mSpin.multiply( new THREE.Matrix4().makeRotationZW(spin) );
+	}
+	if( POLY.dimension>=4 ){
+		mSpin.multiply( new THREE.Matrix4().makeRotationXY(spin) );
+		mSpin.multiply( new THREE.Matrix4().makeRotationXZ(spin) );
+		mSpin.multiply( new THREE.Matrix4().makeRotationYZ(spin) );
+	}
+	//Update coords
+	for( var v=0; v<POLY.verts.length; v++ )
+		POLY.verts[v].applyMatrix4( mSpin );
+	for( var c=0; c<POLY.cellCenters.length; c++)
+		POLY.cellCenters[c].applyMatrix4( mSpin );
+	for( var f=0; f<POLY.faceCenters.length; f++)
+		POLY.faceCenters[f].applyMatrix4( mSpin );
+//	if( POLY_SHOW_EDGES )
+//		for( var c=0; c<POLY.cellCenters.length; c++)
+//			POLY.cellEdgeHelpers[c].geometry.applyMatrix( mSpin );
+	//Update shadow coords
+	for( var v=0; v<POLY.verts.length; v++ ){
+		POLY.verts2[v].x = POLY.verts[v].x;
+		POLY.verts2[v].y = shadowDrop;
+		POLY.verts2[v].z = POLY.verts[v].z;
+	}
+	for( var c=0; c<POLY.numCells; c++ ){
+		POLY.cellCenters2[c].x = POLY.cellCenters[c].x;
+		POLY.cellCenters2[c].y = shadowDrop;
+		POLY.cellCenters2[c].z = POLY.cellCenters[c].z;
+	}
+	for( var f=0; f<POLY.faceCenters.length; f++){
+		POLY.faceCenters2[f].x = POLY.faceCenters[f].x;
+		POLY.faceCenters2[f].y = shadowDrop;
+		POLY.faceCenters2[f].z = POLY.faceCenters[f].z;
+	}
+	//Request updates
+	for( var c=0; c<POLY.numCells; c++ ){
+		POLY.cellMeshes[c].geometry.verticesNeedUpdate = true;
+		POLY.cellMeshes2[c].geometry.verticesNeedUpdate = true;
+	}
+	//Edges
+	if( POLY_SHOW_EDGES ){
+		for( var c=0; c<POLY.numCells; c++ ){
+			//TODO: Simplify and stop memory leak, solve sizing bug
+			
+		//	var lines = THREE.LineSegments( POLY.cellMeshes[c], new THREE.LineBasicMaterial({color:0xFFFFFF}) );
+		//	var lines2 = THREE.LineSegments( POLY.cellMeshes2[c], new THREE.LineBasicMaterial({color:0xFFFFFF}) );
+		//	POLY.group.add( lines );
+
+			//*
+			POLY.group.remove( POLY.cellEdgeHelpers[c] );
+			delete POLY.cellEdgeHelpers[c];
+			POLY.cellEdgeHelpers[c] = new THREE.EdgesHelper( POLY.cellMeshes[c], 0xFFFFFF );
+			POLY.cellEdgeHelpers[c].material.linewidth = .5;
+			POLY.group.add( POLY.cellEdgeHelpers[c] );
+			
+			POLY.group2.remove( POLY.cellEdgeHelpers2[c] );
+			delete POLY.cellEdgeHelpers2[c];
+			POLY.cellEdgeHelpers2[c] = new THREE.EdgesHelper( POLY.cellMeshes2[c], 0xFFFFFF );
+			POLY.cellEdgeHelpers2[c].material.linewidth = .5;
+			POLY.group2.add( POLY.cellEdgeHelpers2[c] );
+			//*/
+		}
+	}
+
+} //animatePoly
+
+function animateSpace( dt_s ){
+	if( SPACE_ROTATE )
+		SPACE.geometry.rotateY( .05*dt_s );
+} //animateSpace
+
+function animate( timestamp ){
+//	CLOCK.stop();
+//	var dt_s = CLOCK.elapsedTime;
+	var dt_s = Math.min(timestamp - T_LAST_RENDER, 500)/1000;
+	keyControl( dt_s );
+	animatePoly( dt_s );
+	animateSpace( dt_s );
+	//Update VR headset position and apply to camera.
+	if( EVT_ORIENT!=null && EVT_ORIENT.alpha!=null )
+		CONTROLS.update();
+	//Control poly ellitical orbit with camera
+	var dir = CAMERA.getWorldDirection();
+	var azim = Math.atan2(dir.z, dir.x);
+	var elev = Math.asin(dir.y);
+	var A = 3 + 1.5*Math.cos(azim)*Math.cos(elev);
+	POLY.group.position.set( A*dir.x, A*dir.y, A*dir.z )
+	/*
+	//Reticle
+	RETICLE.reticle_loop();
+	//Clear unselected	//TODO: Improve
+	for( var c=0; c<RETICLE.colliders.length; c++ ){
+		var targeted = false;
+		for( var i=0; i<RETICLE.intersects.length; i++ )
+			if( RETICLE.colliders[c] == RETICLE.intersects[i].object )
+				targeted = true;
+		if( !targeted )
+			RETICLE.colliders[c].ongazeout();
+	}
+	//*/
+	//Render the scene through the manager.
+	MANAGER.render( SCENE, CAMERA, timestamp );
+	requestAnimationFrame( animate );
+	T_LAST_RENDER = timestamp;
+//	CLOCK.start();
+} //animate
+
+function keyControl( dt_s ){
+	var turn = dt_s*2/Math.PI, step = dt_s;
+	if( KEYS_DOWN[87] )	CAMERA.position.add( CAMERA.getWorldDirection().clone().setLength( step) );	//w
+	if( KEYS_DOWN[83] )	CAMERA.position.add( CAMERA.getWorldDirection().clone().setLength(-step) );	//s
+	if( KEYS_DOWN[81] )	CAMERA.rotateY( turn);	//q
+	if( KEYS_DOWN[69] )	CAMERA.rotateY(-turn);	//e
+	if( KEYS_DOWN[65] )	CAMERA.position.add( CAMERA.getWorldDirection().clone().cross(CAMERA.up).setLength(-step) );	//a	//TODO: Fix strafe
+	if( KEYS_DOWN[68] )	CAMERA.position.add( CAMERA.getWorldDirection().clone().cross(CAMERA.up).setLength( step) );	//d
+	if( KEYS_DOWN[90] )	CAMERA.rotateZ( turn);	//z
+	if( KEYS_DOWN[67] )	CAMERA.rotateZ(-turn);	//c
+	if( KEYS_DOWN[37] )	CAMERA.rotateY( turn);	//L
+	if( KEYS_DOWN[38] )	CAMERA.rotateX( turn);	//U
+	if( KEYS_DOWN[39] )	CAMERA.rotateY(-turn);	//R
+	if( KEYS_DOWN[40] )	CAMERA.rotateX(-turn);	//D
+} //keyControl
+
+function initSpace(){
+	var geo = new THREE.SphereGeometry( 50, 24, 24 );
+	var tex = THREE.ImageUtils.loadTexture( "img/sky1.jpg" );
+	var mat = new THREE.MeshBasicMaterial( {side:THREE.DoubleSide, map:tex} );
+	SPACE = new THREE.Mesh( geo, mat );
+	SCENE.add( SPACE );
+} //initSpace
+
+function initPoly( schlafli ){
+	if( POLY )
+		SCENE.remove( POLY.group );
+	
+	POLY = new Polytope();
+	switch(schlafli){
+		case "33":	POLY.initPoly33();	break;
+		case "34":	POLY.initPoly34();	break;
+		case "43":	POLY.initPoly43();	break;
+		case "35":	POLY.initPoly35();	break;
+		case "53":	POLY.initPoly53();	break;
+		case "333":	POLY.initPoly333();	break;
+		case "334":	POLY.initPoly334();	break;
+		case "343":	POLY.initPoly343();	break;
+		case "433":	POLY.initPoly433();	break;
+		case "335":	POLY.initPoly335();	break;
+		case "533":	POLY.initPoly533();	break;
+		default:	POLY.initPoly433();	break;
+	}
+	POLY.numCells = POLY.cellCenters.length;
+	POLY.group = new THREE.Object3D();
+	POLY.group2 = new THREE.Object3D();
+	//Face Centers
+	POLY.faceCenters = new Array( POLY.faces.length );
+	for( var f=0; f<POLY.faces.length; f++ ){
+		POLY.faceCenters[f] = new THREE.Vector4( 0,0,0,0 );
+		var p = POLY.faces[f].length;
+		for( var q=0; q<p; q++ )
+			POLY.faceCenters[f].add( POLY.verts[POLY.faces[f][q]].clone().multiplyScalar(1/p) );
+	}
+	//Scale
+	POLY_FACE_OPACITY = 3/Math.sqrt(POLY.faces.length);
+	var r = POLY.verts[0].length();
+	for( var v=0; v<POLY.verts.length; v++ )
+		POLY.verts[v].multiplyScalar( POLY_RADIUS/r );
+	for( var c=0; c<POLY.numCells; c++ )
+		POLY.cellCenters[c].multiplyScalar( POLY_RADIUS/r );
+	for( var f=0; f<POLY.faces.length; f++ )
+		POLY.faceCenters[f].multiplyScalar( POLY_RADIUS/r );
+	//Shadow Buffers
+	POLY.verts2 = new Array();
+	for( var v=0; v<POLY.verts.length; v++ )
+		POLY.verts2[v] = POLY.verts[v].clone();
+	POLY.cellCenters2 = new Array();
+	for( var c=0; c<POLY.numCells; c++ )
+		POLY.cellCenters2[c] = POLY.cellCenters[c].clone();
+	POLY.faceCenters2 = new Array();
+	for( var f=0; f<POLY.faces.length; f++ )
+		POLY.faceCenters2[f] = POLY.faceCenters[f].clone();
+	//Materials
+	POLY.cellFaceMats = new Array();
+	POLY.cellFaceMats2 = new Array();
+	for( var c=0; c<POLY.numCells; c++ ){
+		var color = cellColor( c, POLY.cellCenters );
+		POLY.cellFaceMats[c] = new THREE.MeshLambertMaterial( {emissive:color, color:color, side:THREE.DoubleSide, transparent:true, opacity:POLY_FACE_OPACITY, depthTest:false, alphaMap:POLY_TEX_ALPHA} );
+		POLY.cellFaceMats2[c] = new THREE.MeshLambertMaterial( {emissive:color, color:color, side:THREE.DoubleSide, transparent:true, opacity:POLY_FACE_OPACITY/2, depthTest:false, alphaMap:POLY_TEX_ALPHA} );
+	}
+	//Geometries
+	POLY.cellGeoms = new Array();
+	POLY.cellGeoms2 = new Array();
+	for( var c=0; c<POLY.numCells; c++ ){
+		var cvs = POLY.cellVerts[c];
+		var cfs = POLY.cellFaces[c];
+		var geo = new THREE.Geometry();
+		var geo2 = new THREE.Geometry();
+		//Add vertices
+		for( var v=0; v<cvs.length; v++ ){
+			geo.vertices.push( POLY.verts[cvs[v]] );
+			geo2.vertices.push( POLY.verts2[cvs[v]] );
+		}
+		//Add face centers as vertices
+		for(var f=0; f<cfs.length; f++){
+			geo.vertices.push( POLY.faceCenters[cfs[f]] );
+			geo2.vertices.push( POLY.faceCenters2[cfs[f]] );
+		}
+		//Add faces
+		for(var f=0; f<cfs.length; f++){
+			var p = POLY.faces[cfs[f]].length;
+			var us = new Array(p);	//Stores full vertex array indices
+			var vs = new Array(p);	//Stores cell vertex array indices
+			for( var q=0; q<p; q++ ){	//For each vertex in face
+				us[q] = POLY.faces[cfs[f]][q];	//Vertex index
+				vs[q] = 0;
+			}
+			for( var v=0; v<cvs.length; v++ )	//Search each cell vertex
+				for( var q=0; q<p; q++ )
+					if( us[q]==cvs[v] )	//Match to full vertex array index
+						vs[q] = v;	//Create cell vertex array index
+			for( var q=0; q<p; q++ ){
+				geo.faces.push( new THREE.Face3( cvs.length+f, vs[q], vs[(q+1)%p]) );
+				geo2.faces.push( new THREE.Face3( cvs.length+f, vs[q], vs[(q+1)%p]) );
+				geo.faceVertexUvs[0].push( [new THREE.Vector2(0,0), new THREE.Vector2(0,1), new THREE.Vector2(1,1)] );
+				geo2.faceVertexUvs[0].push( [new THREE.Vector2(0,0), new THREE.Vector2(0,1), new THREE.Vector2(1,1)] );
+			}
+		}
+		POLY.cellGeoms[c] = geo;
+		POLY.cellGeoms2[c] = geo2;
+	}
+	//Meshes
+	POLY.cellMeshes = new Array();
+	POLY.cellMeshes2 = new Array();
+	for( var c=0; c<POLY.numCells; c++ ){
+		POLY.cellMeshes[c] = new THREE.Mesh( POLY.cellGeoms[c], POLY.cellFaceMats[c] );
+		POLY.cellMeshes2[c] = new THREE.Mesh( POLY.cellGeoms2[c], POLY.cellFaceMats2[c] );
+		POLY.group.add( POLY.cellMeshes[c] );
+		POLY.group2.add( POLY.cellMeshes2[c] );
+	}
+	//EdgeHelpers
+	POLY.cellEdgeHelpers = new Array();
+	POLY.cellEdgeHelpers2 = new Array();
+	if( POLY_SHOW_EDGES ){;
+/*
+		for( var c=0; c<POLY.numCells; c++ ){
+			POLY.cellEdgeHelpers[c] = new THREE.EdgesHelper( POLY.cellMeshes[c], 0xFFFFFF );
+			POLY.cellEdgeHelpers[c].material.linewidth = .5;
+			POLY.group.add( POLY.cellEdgeHelpers[c] );
+			
+			POLY.cellEdgeHelpers2[c] = new THREE.EdgesHelper( POLY.cellMeshes2[c], 0xFFFFFF );
+			POLY.cellEdgeHelpers2[c].material.linewidth = .5;
+			POLY.group2.add( POLY.cellEdgeHelpers2[c] );
+		}
+//*/
+	}
+	//Reticle
+//	bindReticlePoly( POLY, RETICLE );
+	//End
+	POLY.group.visible = true;
+	POLY.group2.visible = true; 
+	POLY.group.add( POLY.group2 );
+	SCENE.add( POLY.group );
+} //initPoly
+
+function init(){
+//	initWebVrConfig();
+	CLOCK = new THREE.Clock();
+	T_LAST_RENDER = 0;
+	//Setup three.js WebGL renderer. Note: Antialiasing is a big performance hit. Only enable if actually need to
+	RENDERER = new THREE.WebGLRenderer({antialias:true});
+	RENDERER.setPixelRatio(window.devicePixelRatio);
+	//Append the canvas element created by the renderer to document body element
+	document.body.appendChild( RENDERER.domElement );
+	//Create a three.js scene
+	SCENE = new THREE.Scene();
+	//Create a three.js camera
+	CAMERA = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 10000);
+	CAMERA.position.set(0, 0, 0);
+	CAMERA.lookAt( SCENE.position );
+	SCENE.add( CAMERA );
+	//Create a vreticle.js reticle
+	RETICLE = vreticle.Reticle( CAMERA );
+	RETICLE.reticle_object.visible = false;
+	//Apply VR headset positional data to camera
+	CONTROLS = new THREE.VRControls( CAMERA );
+	CONTROLS.standing = false;
+	//Apply VR stereo rendering to renderer
+	EFFECT = new THREE.VREffect( RENDERER );
+	EFFECT.setSize( window.innerWidth, window.innerHeight );
+	//Create a VR manager helper to enter and exit VR mode
+	MANAGER = new WebVRManager( RENDERER, EFFECT, {hideButton:false, isUndistorted:false} );
+	//Poly
+	POLY = null;
+	POLY_TEX_ALPHA = THREE.ImageUtils.loadTexture( "img/facealpha.bmp" );
+	POLY_FACE_OPACITY = 1, POLY_RADIUS = 1, POLY_SHOW_EDGES = !true;	//NOTE: Edges is very buggy
+	SHAPE_INDEX = 8, SHAPE_SCHLAFLIS = ["33", "34", "43", "35", "53", "333", "334", "343", "433", "335", "533"];
+	initPoly( SHAPE_SCHLAFLIS[SHAPE_INDEX] );
+	//Space
+	SPACE = null;
+	SPACE_ROTATE = true;
+	initSpace();
+	//Kick off animation loop
+	requestAnimationFrame( animate );
+	//Enable events
+	KEYS_DOWN = new Array(256);
+	EVT_ORIENT = null;
+	window.addEventListener( "resize", onResize, true );
+	window.addEventListener( "vrdisplaypresentchange", onResize, true );
+	window.addEventListener( "keydown", keydown, true );
+	window.addEventListener( "keyup", keyup, true );
+	window.addEventListener( "deviceorientation", deviceOrient, true );
+	RENDERER.domElement.addEventListener( "touchend", touch, false );
+} //init
+
+</script>
+</html>
