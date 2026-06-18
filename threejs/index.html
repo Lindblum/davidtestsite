@@ -14,18 +14,7 @@
 		</style>
 	</head>
 	<body>
-		<div id="info">
-			<a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> xr - haptics
-		</div>
-
-		<script type="importmap">
-			{
-				"imports": {
-					"three": "../build/three.module.js", "three/addons/": "./jsm/"
-				}
-			}
-		</script>
-
+		<div id="info">Haptics Demo</div>
 		<!--script src="pitchshift.js"></script>
 		<script src="dsp.js"></script-->
 		<script type="module">
@@ -900,6 +889,18 @@ function renderGui() {
 	renderer.render( guiScene, guiCamera );
 }
 
+window.onerror = (msg, src, line, col) => {
+  const el = document.createElement("div");
+  el.style.cssText = `
+    position:fixed;bottom:0;left:0;
+    background:black;color:white;
+    font-size:10px;z-index:99999;
+    max-height:40%;
+    overflow:auto;
+  `;
+  el.textContent = `${msg} (${line}:${col})`;
+  document.body.appendChild(el);
+};
 		</script>
 	</body>
 </html>
